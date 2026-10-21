@@ -1,0 +1,1543 @@
+# Adopted from https://github.com/lm-sys/FastChat. Below is the original copyright:
+# Adopted from tatsu-lab@stanford_alpaca. Below is the original copyright:
+#    Copyright 2023 Rohan Taori, Ishaan Gulrajani, Tianyi Zhang, Yann Dubois, Xuechen Li
+#
+#    Licensed under the Apache License, Version 2.0 (the "License");
+#    you may not use this file except in compliance with the License.
+#    You may obtain a copy of the License at
+#
+#        http://www.apache.org/licenses/LICENSE-2.0
+#
+#    Unless required by applicable law or agreed to in writing, software
+#    distributed under the License is distributed on an "AS IS" BASIS,
+#    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#    See the License for the specific language governing permissions and
+#    limitations under the License.
+
+import os
+import copy
+from dataclasses import dataclass, field
+import json
+import logging
+import pathlib
+import random
+from typing import Dict, Optional, Sequence, List
+
+import torch
+
+import transformers
+import tokenizers
+
+from llava.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
+from torch.utils.data import Dataset
+from llava.train.llava_trainer import LLaVATrainer
+
+from llava import conversation as conversation_lib
+from llava.model import *
+from llava.mm_utils import tokenizer_image_token
+
+
+from PIL import Image
+
+
+local_rank = None
+
+
+def list_of_integers(string, ratio = 1):  
+    if string  != None:
+        if ',' not in string:
+            return [int(string)* ratio ]
+        return [int(item)* ratio for item  in string.split(',')]  
+    else:
+        return string
+    
+    
+def rank0_print(*args):
+    if local_rank == 0:
+        print(*args)
+
+
+from packaging import version
+IS_TOKENIZER_GREATER_THAN_0_14 = version.parse(tokenizers.__version__) >= version.parse('0.14')
+
+
+@dataclass
+class ModelArguments:
+    model_name_or_path: Optional[str] = field(default="facebook/opt-125m")
+    version: Optional[str] = field(default="v0")
+    freeze_backbone: bool = field(default=False)
+    tune_mm_mlp_adapter: bool = field(default=False)
+    vision_tower: Optional[str] = field(default=None)
+    mm_vision_select_layer: Optional[int] = field(default=-1)   # default to the last layer
+    pretrain_mm_mlp_adapter: Optional[str] = field(default=None)
+    mm_projector_type: Optional[str] = field(default='linear')
+    mm_use_im_start_end: bool = field(default=False)
+    mm_use_im_patch_token: bool = field(default=True)
+    mm_patch_merge_type: Optional[str] = field(default='flat')
+    mm_vision_select_feature: Optional[str] = field(default="patch")
+    matryoshka_vis_token_scale: Optional[str] = field(default=None)
+    unfreeze_mm_vision_tower: bool = field(default=False)
+    pretrain_elastic_path: Optional[str] = field(default=None,
+        metadata={"help": "Path to Stage 1 elastic checkpoint. "
+                  "Warm-starts elastic_resampler, elastic_projector, and LoRA "
+                  "weights in Stage 2 after attach_elastic_engine."})
+    
+
+
+@dataclass
+class DataArguments:
+    data_path: str = field(default=None,
+                           metadata={"help": "Path to the training data."})
+    lazy_preprocess: bool = False
+    is_multimodal: bool = False
+    image_folder: Optional[str] = field(default=None)
+    image_aspect_ratio: str = 'square'
+
+
+@dataclass
+class TrainingArguments(transformers.TrainingArguments):
+    cache_dir: Optional[str] = field(default=None)
+    optim: str = field(default="adamw_torch")
+    remove_unused_columns: bool = field(default=False)
+    freeze_mm_mlp_adapter: bool = field(default=False)
+    mpt_attn_impl: Optional[str] = field(default="triton")
+    model_max_length: int = field(
+        default=512,
+        metadata={
+            "help":
+            "Maximum sequence length. Sequences will be right padded (and possibly truncated)."
+        },
+    )
+    double_quant: bool = field(
+        default=True,
+        metadata={"help": "Compress the quantization statistics through double quantization."}
+    )
+    quant_type: str = field(
+        default="nf4",
+        metadata={"help": "Quantization data type to use. Should be one of `fp4` or `nf4`."}
+    )
+    bits: int = field(
+        default=16,
+        metadata={"help": "How many bits to use."}
+    )
+    lora_enable: bool = False
+    lora_r: int = 64
+    lora_alpha: int = 16
+    lora_dropout: float = 0.05
+    lora_weight_path: str = ""
+    lora_bias: str = "none"
+    mm_projector_lr: Optional[float] = None
+    group_by_modality_length: bool = field(default=False)
+    group_by_modality_length_auto: bool = field(default=False)
+    group_by_varlen: bool = field(default=False)
+    mm_vision_tower_lr: Optional[float] = None
+    
+
+
+def maybe_zero_3(param, ignore_status=False, name=None):
+    from deepspeed import zero
+    from deepspeed.runtime.zero.partition_parameters import ZeroParamStatus
+    if hasattr(param, "ds_id"):
+        if param.ds_status == ZeroParamStatus.NOT_AVAILABLE:
+            if not ignore_status:
+                logging.warning(f"{name}: param.ds_status != ZeroParamStatus.NOT_AVAILABLE: {param.ds_status}")
+        with zero.GatheredParameters([param]):
+            param = param.data.detach().cpu().clone()
+    else:
+        param = param.detach().cpu().clone()
+    return param
+
+
+def get_full_state_dict_maybe_zero_3(named_params):
+    """Full model state dict (frozen + trained), ZeRO-gathered.
+
+    A LoRA-enabled elastic finetune has two kinds of "lora_" parameters:
+    PEFT-registered ones on the LLM (from get_peft_model), and plain
+    nn.Parameters the elastic engine's NestedLoRALinear injects directly onto
+    the vision tower (llava/model/elastic/nested_lora.py), outside of PEFT's
+    adapter registry. PEFT's own state-dict filtering (used by
+    ``model.save_pretrained`` on a PeftModel) only keeps the former, so a
+    PEFT adapter-only save silently drops the vision-tower nested-LoRA
+    weights. Saving the full state dict here avoids that split entirely.
+    """
+    to_return = {k: maybe_zero_3(v, ignore_status=True) for k, v in named_params}
+    return to_return
+
+
+def get_mm_adapter_state_maybe_zero_3(named_params, keys_to_match):
+    to_return = {k: t for k, t in named_params if any(key_match in k for key_match in keys_to_match)}
+    to_return = {k: maybe_zero_3(v, ignore_status=True).cpu() for k, v in to_return.items()}
+    return to_return
+
+
+def find_all_linear_names(model):
+    cls = torch.nn.Linear
+    lora_module_names = set()
+    multimodal_keywords = ['mm_projector', 'vision_tower', 'vision_resampler']
+    for name, module in model.named_modules():
+        if any(mm_keyword in name for mm_keyword in multimodal_keywords):
+            continue
+        if isinstance(module, cls):
+            names = name.split('.')
+            lora_module_names.add(names[0] if len(names) == 1 else names[-1])
+
+    if 'lm_head' in lora_module_names: # needed for 16-bit
+        lora_module_names.remove('lm_head')
+    return list(lora_module_names)
+
+
+def _load_elastic_pretrain_weights(model, path: str):
+    """Warm-start elastic_resampler, elastic_projector, and LoRA A/B weights
+    from a Stage 1 checkpoint.  Called after attach_elastic_engine so the
+    target submodules already exist in the model.
+
+    Stage 2 uses liuhaotian/llava-v1.5-7b as the LLM base; HF from_pretrained
+    skips unknown keys (elastic modules, LoRA), so they must be loaded here.
+    """
+    import glob as _glob
+    weight_files = sorted(_glob.glob(os.path.join(path, "pytorch_model*.bin")))
+    if not weight_files:
+        try:
+            from safetensors.torch import load_file as _sf_load
+            weight_files = sorted(_glob.glob(os.path.join(path, "model*.safetensors")))
+            _loader = _sf_load
+        except ImportError:
+            _loader = None
+    else:
+        _loader = lambda f: torch.load(f, map_location="cpu")
+
+    if not weight_files:
+        rank0_print(f"[elastic] pretrain_elastic_path={path}: no weight files found, skipping warm-start")
+        return
+
+    elastic_sd = {}
+    for wf in weight_files:
+        sd = _loader(wf)
+        for k, v in sd.items():
+            if any(tag in k for tag in ("elastic_resampler.", "elastic_projector.", ".lora_A", ".lora_B")):
+                elastic_sd[k] = v
+
+    if not elastic_sd:
+        rank0_print(f"[elastic] pretrain_elastic_path={path}: no elastic keys found in checkpoint")
+        return
+
+    # When lora_enable=True the model is PEFT-wrapped; elastic modules were
+    # attached to the underlying model whose state_dict uses unprefixed keys.
+    try:
+        from peft import PeftModel as _PeftModel
+        target = model.base_model.model if isinstance(model, _PeftModel) else model
+    except ImportError:
+        target = model
+    missing, unexpected = target.load_state_dict(elastic_sd, strict=False)
+    loaded = len(elastic_sd) - len(unexpected)
+    elastic_missing = [k for k in missing if any(t in k for t in
+                       ("elastic_resampler", "elastic_projector", "lora_A", "lora_B"))]
+    rank0_print(f"[elastic] warm-started from {path}: "
+                f"{loaded}/{len(elastic_sd)} keys loaded; "
+                f"{len(elastic_missing)} elastic keys still missing "
+                f"(unexpected={len(unexpected)})")
+
+
+
+def align_eos_with_template(tokenizer, conv, model=None):
+    """Make tokenizer.eos_token the token the conversation template writes.
+
+    THE BUG THIS PREVENTS (measured on Phi-3.5, 2026-08-18):
+
+      conv_phi3 terminates every turn with '<|end|>' (id 32007), but
+      Phi-3.5's tokenizer ships eos_token '<|endoftext|>' (id 32000). They are
+      DIFFERENT tokens. debug/check_eos_in_labels.py found 0 eos occurrences in
+      the whole training sequence: the model would be taught to emit '<|end|>'
+      while generate() waits for '<|endoftext|>' and never stops -- the same
+      end state as the pad==eos collision, reached a different way.
+
+    A no-op for every other backbone here, because their template terminator
+    already IS their eos: v1/TinyLlama '</s>', chatml/SmolLM2+Qwen '<|im_end|>',
+    phi/Phi-2 '<|endoftext|>'. It only fires on a genuine mismatch, and a
+    genuine mismatch is always a bug.
+
+    Only rewrites eos when the terminator is a single already-registered token,
+    so it can never silently expand the vocabulary.
+    """
+    term = conv.sep2 if conv.sep_style == conversation_lib.SeparatorStyle.TWO else conv.sep
+    if not term:
+        return
+    term = term.strip()
+    if not term or term == tokenizer.eos_token:
+        return
+
+    term_id = tokenizer.convert_tokens_to_ids(term)
+    unk_id = getattr(tokenizer, "unk_token_id", None)
+    if term_id is None or term_id == unk_id:
+        rank0_print(f"[eos-align] template terminator {term!r} is not a single "
+                    f"registered token; leaving eos_token {tokenizer.eos_token!r} alone")
+        return
+
+    old = tokenizer.eos_token
+    tokenizer.eos_token = term
+    rank0_print(f"[eos-align] template terminates turns with {term!r} (id {term_id}) "
+                f"but eos_token was {old!r}; eos_token is now {term!r}")
+
+    # The tokenizer alone is not enough: generation reads eos_token_id off the
+    # model config / generation config, and those are what a later eval loads.
+    if model is not None:
+        if getattr(model, "config", None) is not None:
+            model.config.eos_token_id = term_id
+        gen = getattr(model, "generation_config", None)
+        if gen is not None:
+            gen.eos_token_id = term_id
+
+
+def ensure_distinct_pad_token(tokenizer, model=None):
+    """Guarantee pad_token_id != eos_token_id, for every backbone family.
+
+    THE BUG THIS PREVENTS (measured on TinyLlama, 2026-08-13):
+
+      DataCollatorForSupervisedDataset builds
+          attention_mask = input_ids.ne(tokenizer.pad_token_id)
+      and prepare_inputs_labels_for_multimodal (llava_arch.py ~line 270,
+      "remove the padding using attention_mask -- FIXME") then DELETES every
+      masked position from input_ids AND labels.
+
+      So if pad_token == eos_token, every genuine end-of-turn token is treated
+      as padding and removed from the labels. The model is never trained to
+      stop. Measured: 9 EOS in the labels before expansion, 0 after; at eval
+      the model ran to max_new_tokens on 84% of GQA questions and scored 0.00%
+      exact match despite 48% of answers starting with the correct word.
+
+    TinyLlama-1.1B-Chat and several other chat-tuned SLMs ship
+    pad_token == '</s>' == eos_token. Llama/Vicuna ship no pad_token at all and
+    fall through to unk (id 0), which is why the 7B recipe was unaffected and
+    why this guard is a no-op there.
+
+    Preference order: existing distinct pad -> unk_token -> a fresh [PAD]
+    (which resizes embeddings, so it is the last resort).
+    """
+    eos_id = tokenizer.eos_token_id
+    if tokenizer.pad_token is not None and tokenizer.pad_token_id != eos_id:
+        return tokenizer.pad_token            # already safe
+
+    why = "pad_token is None" if tokenizer.pad_token is None else \
+          f"pad_token {tokenizer.pad_token!r} == eos_token"
+    unk_id = getattr(tokenizer, "unk_token_id", None)
+    if tokenizer.unk_token is not None and unk_id is not None and unk_id != eos_id:
+        tokenizer.pad_token = tokenizer.unk_token
+        rank0_print(f"[pad-guard] {why}; using unk_token "
+                    f"{tokenizer.pad_token!r} (id {tokenizer.pad_token_id}) as pad")
+    else:
+        # no distinct token available (Qwen2/Phi-2 style): mint one
+        smart_tokenizer_and_embedding_resize(
+            special_tokens_dict=dict(pad_token="[PAD]"),
+            tokenizer=tokenizer, model=model)
+        rank0_print(f"[pad-guard] {why}; added a new [PAD] token "
+                    f"(id {tokenizer.pad_token_id}) and resized embeddings")
+    assert tokenizer.pad_token_id != eos_id, "pad-guard failed to separate pad from eos"
+    return tokenizer.pad_token
+
+
+def _merge_lora_state_dict(state_dict, scale: float):
+    """Fold PEFT LoRA deltas into their base weights and restore plain HF keys.
+
+    Turns the triple
+
+        <stem>.base_layer.weight / <stem>.lora_A.default.weight
+                                 / <stem>.lora_B.default.weight
+
+    into a single `<stem>.weight` = base + scale * (B @ A).
+
+    Done on the gathered state dict rather than via PeftModel.merge_and_unload()
+    because at this point the weights have already been collected out of the
+    ZeRO shards; mutating the live DeepSpeed-wrapped model instead would be a
+    good deal more delicate for no benefit.
+
+    Keys with no LoRA attached pass through untouched. A no-op on state dicts
+    that carry no `.base_layer.weight`, so the non-LoRA path is unaffected.
+    """
+    stems = {k[: -len(".base_layer.weight")]
+             for k in state_dict if k.endswith(".base_layer.weight")}
+    if not stems:
+        return state_dict
+
+    out, merged = {}, 0
+    for stem in stems:
+        base = state_dict.pop(f"{stem}.base_layer.weight")
+        ka, kb = f"{stem}.lora_A.default.weight", f"{stem}.lora_B.default.weight"
+        if ka in state_dict and kb in state_dict:
+            A = state_dict.pop(ka).to(torch.float32)
+            B = state_dict.pop(kb).to(torch.float32)
+            # A: (r, in), B: (out, r) -> B @ A: (out, in), matching base
+            out[f"{stem}.weight"] = (base.to(torch.float32) + scale * (B @ A)).to(base.dtype)
+            merged += 1
+        else:
+            out[f"{stem}.weight"] = base
+
+    for k in list(state_dict.keys()):
+        if ".lora_A." in k or ".lora_B." in k or ".base_layer." in k:
+            rank0_print(f"[lora-merge] dropping unhandled PEFT key {k}")
+            state_dict.pop(k)
+            continue
+        out[k] = state_dict.pop(k)
+
+    rank0_print(f"[lora-merge] merged {merged} LoRA modules (scale={scale}); "
+                f"{len(out)} tensors saved with plain keys")
+    return out
+
+
+def safe_save_model_for_hf_trainer(trainer: transformers.Trainer,
+                                   output_dir: str):
+    """Collects the state dict and dump to disk."""
+
+    if getattr(trainer.args, "tune_mm_mlp_adapter", False):
+        # Only save Adapter
+        keys_to_match = ['mm_projector']
+        if getattr(trainer.args, "use_im_start_end", False):
+            keys_to_match.extend(['embed_tokens', 'embed_in'])
+
+        weight_to_save = get_mm_adapter_state_maybe_zero_3(trainer.model.named_parameters(), keys_to_match)
+        trainer.model.config.save_pretrained(output_dir)
+
+        current_folder = output_dir.split('/')[-1]
+        parent_folder = os.path.dirname(output_dir)
+        if trainer.args.local_rank == 0 or trainer.args.local_rank == -1:
+            if current_folder.startswith('checkpoint-'):
+                mm_projector_folder = os.path.join(parent_folder, "mm_projector")
+                os.makedirs(mm_projector_folder, exist_ok=True)
+                torch.save(weight_to_save, os.path.join(mm_projector_folder, f'{current_folder}.bin'))
+            else:
+                torch.save(weight_to_save, os.path.join(output_dir, f'mm_projector.bin'))
+        return
+
+    if trainer.deepspeed:
+        torch.cuda.synchronize()
+        trainer.save_model(output_dir)
+        return
+
+    state_dict = trainer.model.state_dict()
+    if trainer.args.should_save:
+        cpu_state_dict = {
+            key: value.cpu()
+            for key, value in state_dict.items()
+        }
+        del state_dict
+        trainer._save(output_dir, state_dict=cpu_state_dict)  # noqa
+
+
+def smart_tokenizer_and_embedding_resize(
+    special_tokens_dict: Dict,
+    tokenizer: transformers.PreTrainedTokenizer,
+    model: transformers.PreTrainedModel,
+):
+    """Resize tokenizer and embedding, keeping the matrix tensor-core aligned.
+
+    `pad_to_multiple_of=64` matters because several backbones declare a
+    vocab_size LARGER than their tokenizer, padded for alignment. Phi-2 is the
+    sharp case: config.vocab_size 51200 vs len(tokenizer) 50295 (50257 base +
+    39 added specials). A bare resize_token_embeddings(len(tokenizer)) would
+    SHRINK 51200 -> 50296, dropping 904 rows from embed_tokens and, since
+    Phi-2 does not tie weights, 904 more from lm_head (transformers copies
+    only [:min(old, new)]). Those rows are unreachable padding so the accuracy
+    cost is ~nil, but the result is a 50296-row matrix that is not a multiple
+    of 64 and a checkpoint whose vocab_size no longer matches the base model.
+    Rounding to 50304 keeps the alignment and never shrinks below what the
+    tokenizer needs.
+
+    The new tokens must then be located BY ID, not by negative offset. With
+    padding, `[PAD]` sits at id len(tokenizer)-1 == 50295 while the matrix runs
+    to 50303, so the original `embeddings[-num_new_tokens:] = avg` would
+    initialise row 50303 and leave the real pad row at its random init -- a
+    token the collator emits on every single batch.
+    """
+    num_new_tokens = tokenizer.add_special_tokens(special_tokens_dict)
+
+    if model is None:
+        # Tokenizer-only callers (debug/check_eos_in_labels.py inspects label
+        # masking with no model loaded). ensure_distinct_pad_token's signature
+        # already allows model=None, and Phi-2/Qwen-style backbones are exactly
+        # the ones that reach this branch, so this must not crash on them.
+        return
+
+    model.resize_token_embeddings(len(tokenizer), pad_to_multiple_of=64)
+
+    if num_new_tokens > 0:
+        input_embeddings = model.get_input_embeddings().weight.data
+        output_embeddings = model.get_output_embeddings().weight.data
+
+        # Mean of the pretrained rows only, i.e. everything below the tokens we
+        # just added. Alignment padding above len(tokenizer) is excluded too.
+        n_old = len(tokenizer) - num_new_tokens
+        input_embeddings_avg = input_embeddings[:n_old].mean(dim=0, keepdim=True)
+        output_embeddings_avg = output_embeddings[:n_old].mean(dim=0, keepdim=True)
+
+        # add_special_tokens appends, so the new tokens are exactly the ids in
+        # [n_old, len(tokenizer)) -- below any alignment padding.
+        input_embeddings[n_old:len(tokenizer)] = input_embeddings_avg
+        output_embeddings[n_old:len(tokenizer)] = output_embeddings_avg
+
+
+def _tokenize_fn(strings: Sequence[str],
+                 tokenizer: transformers.PreTrainedTokenizer) -> Dict:
+    """Tokenize a list of strings."""
+    tokenized_list = [
+        tokenizer(
+            text,
+            return_tensors="pt",
+            padding="longest",
+            max_length=tokenizer.model_max_length,
+            truncation=True,
+        ) for text in strings
+    ]
+    input_ids = labels = [
+        tokenized.input_ids[0] for tokenized in tokenized_list
+    ]
+    input_ids_lens = labels_lens = [
+        tokenized.input_ids.ne(tokenizer.pad_token_id).sum().item()
+        for tokenized in tokenized_list
+    ]
+    return dict(
+        input_ids=input_ids,
+        labels=labels,
+        input_ids_lens=input_ids_lens,
+        labels_lens=labels_lens,
+    )
+
+
+def _mask_targets(target, tokenized_lens, speakers):
+    # cur_idx = 0
+    cur_idx = tokenized_lens[0]
+    tokenized_lens = tokenized_lens[1:]
+    target[:cur_idx] = IGNORE_INDEX
+    for tokenized_len, speaker in zip(tokenized_lens, speakers):
+        if speaker == "human":
+            target[cur_idx+2:cur_idx + tokenized_len] = IGNORE_INDEX
+        cur_idx += tokenized_len
+
+
+def _add_speaker_and_signal(header, source, get_conversation=True):
+    """Add speaker and start/end signal on each round."""
+    BEGIN_SIGNAL = "### "
+    END_SIGNAL = "\n"
+    conversation = header
+    for sentence in source:
+        from_str = sentence["from"]
+        if from_str.lower() == "human":
+            from_str = conversation_lib.default_conversation.roles[0]
+        elif from_str.lower() == "gpt":
+            from_str = conversation_lib.default_conversation.roles[1]
+        else:
+            from_str = 'unknown'
+        sentence["value"] = (BEGIN_SIGNAL + from_str + ": " +
+                             sentence["value"] + END_SIGNAL)
+        if get_conversation:
+            conversation += sentence["value"]
+    conversation += BEGIN_SIGNAL
+    return conversation
+
+
+def preprocess_multimodal(
+    sources: Sequence[str],
+    data_args: DataArguments
+) -> Dict:
+    is_multimodal = data_args.is_multimodal
+    if not is_multimodal:
+        return sources
+
+    for source in sources:
+        for sentence in source:
+            if DEFAULT_IMAGE_TOKEN in sentence['value']:
+                sentence['value'] = sentence['value'].replace(DEFAULT_IMAGE_TOKEN, '').strip()
+                sentence['value'] = DEFAULT_IMAGE_TOKEN + '\n' + sentence['value']
+                sentence['value'] = sentence['value'].strip()
+                if "mmtag" in conversation_lib.default_conversation.version:
+                    sentence['value'] = sentence['value'].replace(DEFAULT_IMAGE_TOKEN, '<Image>' + DEFAULT_IMAGE_TOKEN + '</Image>')
+            replace_token = DEFAULT_IMAGE_TOKEN
+            if data_args.mm_use_im_start_end:
+                replace_token = DEFAULT_IM_START_TOKEN + replace_token + DEFAULT_IM_END_TOKEN
+            sentence["value"] = sentence["value"].replace(DEFAULT_IMAGE_TOKEN, replace_token)
+
+    return sources
+
+
+def preprocess_llama_2(
+    sources,
+    tokenizer: transformers.PreTrainedTokenizer,
+    has_image: bool = False
+) -> Dict:
+    conv = conversation_lib.default_conversation.copy()
+    roles = {"human": conv.roles[0], "gpt": conv.roles[1]}
+
+    # Apply prompt templates
+    conversations = []
+    for i, source in enumerate(sources):
+        if roles[source[0]["from"]] != conv.roles[0]:
+            # Skip the first one if it is not from human
+            source = source[1:]
+
+        conv.messages = []
+        for j, sentence in enumerate(source):
+            role = roles[sentence["from"]]
+            assert role == conv.roles[j % 2], f"{i}"
+            conv.append_message(role, sentence["value"])
+        conversations.append(conv.get_prompt())
+
+    # Tokenize conversations
+
+    if has_image:
+        input_ids = torch.stack([tokenizer_image_token(prompt, tokenizer, return_tensors='pt') for prompt in conversations], dim=0)
+    else:
+        input_ids = tokenizer(
+            conversations,
+            return_tensors="pt",
+            padding="longest",
+            max_length=tokenizer.model_max_length,
+            truncation=True,
+        ).input_ids
+
+    targets = input_ids.clone()
+
+    assert conv.sep_style == conversation_lib.SeparatorStyle.LLAMA_2
+
+    # Mask targets
+    sep = "[/INST] "
+    for conversation, target in zip(conversations, targets):
+        total_len = int(target.ne(tokenizer.pad_token_id).sum())
+
+        rounds = conversation.split(conv.sep2)
+        cur_len = 1
+        target[:cur_len] = IGNORE_INDEX
+        i = 0
+        for i, rou in enumerate(rounds):
+            if rou == "":
+                break
+
+            parts = rou.split(sep)
+            if len(parts) != 2:
+                break
+            parts[0] += sep
+
+            if has_image:
+                round_len = len(tokenizer_image_token(rou, tokenizer))
+                instruction_len = len(tokenizer_image_token(parts[0], tokenizer)) - 2
+            else:
+                round_len = len(tokenizer(rou).input_ids)
+                instruction_len = len(tokenizer(parts[0]).input_ids) - 2
+
+            target[cur_len : cur_len + instruction_len] = IGNORE_INDEX
+
+            cur_len += round_len
+        target[cur_len:] = IGNORE_INDEX
+
+        if cur_len < tokenizer.model_max_length:
+            # Round-length accounting is a reconstruct-and-retokenize
+            # approximation, not a true offset mapping. Some tokenizers
+            # (confirmed: TinyLlama's) have a per-round BOS-handling quirk
+            # relative to vicuna's that costs ~1 extra token PER ROUND, not a
+            # single fixed amount -- empirically confirmed as +1/round across
+            # multiple real multi-turn samples. A fixed tolerance therefore
+            # either fails long conversations (too tight) or stops catching
+            # real corruption like a dropped round (too loose). Scale with
+            # the number of rounds actually processed (`i`) instead: a
+            # genuinely dropped/misparsed round loses that round's full
+            # content (typically tens of tokens minimum), which still safely
+            # exceeds this margin, while the benign per-round drift never does.
+            MISMATCH_TOLERANCE = 2 + 2 * i
+            if abs(cur_len - total_len) > MISMATCH_TOLERANCE:
+                target[:] = IGNORE_INDEX
+                print(
+                    f"WARNING: tokenization mismatch: {cur_len} vs. {total_len}."
+                    f" (ignored)"
+                )
+
+    return dict(
+        input_ids=input_ids,
+        labels=targets,
+    )
+
+
+def preprocess_v1(
+    sources,
+    tokenizer: transformers.PreTrainedTokenizer,
+    has_image: bool = False
+) -> Dict:
+    conv = conversation_lib.default_conversation.copy()
+    roles = {"human": conv.roles[0], "gpt": conv.roles[1]}
+
+    # Apply prompt templates
+    conversations = []
+    for i, source in enumerate(sources):
+        if roles[source[0]["from"]] != conv.roles[0]:
+            # Skip the first one if it is not from human
+            source = source[1:]
+
+        conv.messages = []
+        for j, sentence in enumerate(source):
+            role = roles[sentence["from"]]
+            assert role == conv.roles[j % 2], f"{i}"
+            conv.append_message(role, sentence["value"])
+        conversations.append(conv.get_prompt())
+
+    # Tokenize conversations
+
+    if has_image:
+        input_ids = torch.stack([tokenizer_image_token(prompt, tokenizer, return_tensors='pt') for prompt in conversations], dim=0)
+    else:
+        input_ids = tokenizer(
+            conversations,
+            return_tensors="pt",
+            padding="longest",
+            max_length=tokenizer.model_max_length,
+            truncation=True,
+        ).input_ids
+
+    targets = input_ids.clone()
+
+    assert conv.sep_style == conversation_lib.SeparatorStyle.TWO
+
+    # Mask targets
+    sep = conv.sep + conv.roles[1] + ": "
+    n_prefix = _auto_prefix_len(tokenizer)
+    # `rounds` is split on sep2, so each `rou` is missing the separator that
+    # terminates it in the real sequence -- yet round_len below is just
+    # len(tokenizer(rou)). On Llama that accidentally balances: the re-tokenized
+    # `rou` carries a spurious BOS (+1) which exactly offsets the missing "</s>"
+    # (-1). On a tokenizer that prepends nothing there is no BOS to donate, so
+    # cur_len falls one token behind per round. Account for both explicitly.
+    if has_image:
+        sep2_len = len(tokenizer_image_token(conv.sep2, tokenizer)) - n_prefix
+    else:
+        sep2_len = len(tokenizer(conv.sep2).input_ids) - n_prefix
+    for conversation, target in zip(conversations, targets):
+        total_len = int(target.ne(tokenizer.pad_token_id).sum())
+
+        rounds = conversation.split(conv.sep2)
+        # Skip the auto-prepended BOS, if this tokenizer emits one. Was
+        # hard-coded to 1; the BPE backbones (Phi-2 here) prepend nothing, so
+        # starting at 1 shifts every subsequent round's mask by one token.
+        cur_len = n_prefix
+        target[:cur_len] = IGNORE_INDEX
+        i = 0
+        for i, rou in enumerate(rounds):
+            if rou == "":
+                break
+
+            parts = rou.split(sep)
+            if len(parts) != 2:
+                break
+            parts[0] += sep
+
+            # -(n_prefix + 1): one for the auto-prepended BOS (0 on BPE
+            # tokenizers), one for the trailing space of " ASSISTANT: " that
+            # merges into the following token in context but not when parts[0]
+            # is tokenized standalone. Was hard-coded -2, i.e. n_prefix == 1.
+            if has_image:
+                round_len = len(tokenizer_image_token(rou, tokenizer)) - n_prefix + sep2_len
+                instruction_len = len(tokenizer_image_token(parts[0], tokenizer)) - n_prefix - 1
+            else:
+                round_len = len(tokenizer(rou).input_ids) - n_prefix + sep2_len
+                instruction_len = len(tokenizer(parts[0]).input_ids) - n_prefix - 1
+
+            # `legacy` is a SentencePiece/LlamaTokenizer-only attribute describing a
+            # specific BOS-reinsertion quirk in tokenizers>=0.14; non-SentencePiece
+            # tokenizers (e.g. phi-2's CodeGenTokenizer) don't have it at all, and
+            # accessing it directly crashes on every multi-round sample. Default to
+            # True (the quirk-free / no-correction behavior) since the quirk is
+            # specific to LLaMA's tokenizer family and doesn't apply elsewhere.
+            if i != 0 and not getattr(tokenizer, "legacy", True) and IS_TOKENIZER_GREATER_THAN_0_14:
+                round_len -= 1
+                instruction_len -= 1
+
+            target[cur_len : cur_len + instruction_len] = IGNORE_INDEX
+
+            cur_len += round_len
+        target[cur_len:] = IGNORE_INDEX
+
+        if cur_len < tokenizer.model_max_length:
+            # Round-length accounting is a reconstruct-and-retokenize
+            # approximation, not a true offset mapping. Some tokenizers
+            # (confirmed: TinyLlama's) have a per-round BOS-handling quirk
+            # relative to vicuna's that costs ~1 extra token PER ROUND, not a
+            # single fixed amount -- empirically confirmed as +1/round across
+            # multiple real multi-turn samples. A fixed tolerance therefore
+            # either fails long conversations (too tight) or stops catching
+            # real corruption like a dropped round (too loose). Scale with
+            # the number of rounds actually processed (`i`) instead: a
+            # genuinely dropped/misparsed round loses that round's full
+            # content (typically tens of tokens minimum), which still safely
+            # exceeds this margin, while the benign per-round drift never does.
+            MISMATCH_TOLERANCE = 2 + 2 * i
+            if abs(cur_len - total_len) > MISMATCH_TOLERANCE:
+                target[:] = IGNORE_INDEX
+                print(
+                    f"WARNING: tokenization mismatch: {cur_len} vs. {total_len}."
+                    f" (ignored)"
+                )
+
+    return dict(
+        input_ids=input_ids,
+        labels=targets,
+    )
+
+
+def _auto_prefix_len(tokenizer: transformers.PreTrainedTokenizer) -> int:
+    """How many tokens this tokenizer prepends to EVERY encode call (i.e. BOS).
+
+    preprocess_v1 / preprocess_mpt reconstruct each round, re-tokenize it, and
+    subtract a constant to undo that automatic prefix. The shipped constants
+    (`- 1`, `- 2`, `cur_len = 1`) hard-code "exactly one BOS", which holds for
+    Llama/SentencePiece (Vicuna, TinyLlama, MobileLLaMA) and is FALSE for
+    GPT-2-style BPE (SmolLM2, Qwen2.5, StableLM-2, Phi-2, Phi-3.5), which
+    prepend nothing. On those, `sep_len` collapses to 0, so cur_len stops
+    advancing past the separator and the mask window slides one token earlier
+    every round -- leaving role-marker fragments ("istant\\n", "<|im_start|>")
+    supervised and the answer's own tokens masked. Measured on SmolLM2: only
+    3.1% of short-answer samples had EOS supervised, and the supervised span
+    was role scaffolding rather than the answer.
+
+    Deriving it from the tokenizer is a no-op for the BOS-adding backbones
+    (it returns 1, reproducing the old constants exactly), so the working
+    7B/TinyLlama recipes are unaffected.
+    """
+    cached = getattr(tokenizer, "_llava_auto_prefix_len", None)
+    if cached is None:
+        cached = len(tokenizer("").input_ids)
+        tokenizer._llava_auto_prefix_len = cached
+    return cached
+
+
+# Job 26687, Phi-3.5: what a span costs STANDALONE vs. in context.
+#
+#     '<|end|>'               standalone 2   in context 1   (+1)
+#     '<|user|>'              standalone 2   in context 1   (+1)
+#     '<|end|><|assistant|>'  standalone 3   in context 2   (+1)
+#     'Yes'                   standalone 1   in context 1   ( 0)
+#
+# SentencePiece inserts a dummy '_' before the first piece of every encode
+# call, and a registered special token cannot absorb it. Every span in the
+# phi3 template starts with a special token, so standalone round accounting
+# ran ahead every round. An "append to a fixed anchor" measurement was tried
+# to cancel that and REGRESSED SmolLM2 to 1 supervised token per sample --
+# BPE merges the anchor with the span's first character. preprocess_mpt now
+# tokenizes true prefixes of the real conversation instead, which has no
+# boundary to get wrong.
+
+
+def preprocess_mpt(
+    sources,
+    tokenizer: transformers.PreTrainedTokenizer,
+    has_image: bool = False
+) -> Dict:
+    conv = conversation_lib.default_conversation.copy()
+    roles = {"human": conv.roles[0], "gpt": conv.roles[1]}
+
+    # Apply prompt templates
+    conversations = []
+    for i, source in enumerate(sources):
+        if roles[source[0]["from"]] != conv.roles[0]:
+            # Skip the first one if it is not from human
+            source = source[1:]
+
+        conv.messages = []
+        for j, sentence in enumerate(source):
+            role = roles[sentence["from"]]
+            assert role == conv.roles[j % 2], f"{i}"
+            conv.append_message(role, sentence["value"])
+        conversations.append(conv.get_prompt())
+
+    # Tokenize conversations
+
+    if has_image:
+        input_ids = torch.stack([tokenizer_image_token(prompt, tokenizer, return_tensors='pt') for prompt in conversations], dim=0)
+    else:
+        input_ids = tokenizer(
+            conversations,
+            return_tensors="pt",
+            padding="longest",
+            max_length=tokenizer.model_max_length,
+            truncation=True,
+        ).input_ids
+
+    targets = input_ids.clone()
+    assert conv.sep_style == conversation_lib.SeparatorStyle.MPT
+
+    # Mask targets
+    sep = conv.sep + conv.roles[1]
+    for conversation, target in zip(conversations, targets):
+        total_len = int(target.ne(tokenizer.pad_token_id).sum())
+
+        rounds = conversation.split(conv.sep)
+        re_rounds = [conv.sep.join(rounds[:3])] # system + user + gpt
+        for conv_idx in range(3, len(rounds), 2):
+            re_rounds.append(conv.sep.join(rounds[conv_idx:conv_idx+2]))    # user + gpt
+        # Boundaries are located by tokenizing TRUE PREFIXES of this exact
+        # conversation string, never a span in isolation. Both earlier schemes
+        # measured spans out of context and needed a correction term for what
+        # that changed -- a constant for BOS (wrong on SentencePiece's dummy
+        # '_'), then a synthetic anchor (wrong on BPE, which merges the anchor
+        # with the span's first character: it collapsed SmolLM2 to 1 supervised
+        # token per sample while leaving Qwen intact). A prefix of the real
+        # string has no boundary to get wrong, so no correction term exists to
+        # be wrong about.
+        tk_len = ((lambda s: len(tokenizer_image_token(s, tokenizer))) if has_image
+                  else (lambda s: len(tokenizer(s).input_ids)))
+        cur_len = tk_len("")           # BOS / dummy prefix, whatever this tokenizer emits
+        target[:cur_len] = IGNORE_INDEX
+        i = 0
+        cur_char = 0
+        for i, rou in enumerate(re_rounds):
+            if rou == "":
+                break
+
+            parts = rou.split(sep)
+            if len(parts) != 2:
+                break
+            parts[0] += sep
+
+            # Character offsets into `conversation`, converted to token offsets
+            # by tokenizing the prefix that ends there. re_rounds were rejoined
+            # from chunks that split() stripped conv.sep from, so each round
+            # occupies len(rou) + len(conv.sep) characters of the original.
+            instr_end = tk_len(conversation[:cur_char + len(parts[0])])
+            cur_char += len(rou) + len(conv.sep)
+            round_end = tk_len(conversation[:cur_char])
+
+            target[cur_len:instr_end] = IGNORE_INDEX
+            cur_len = round_end
+            # No separator fix-up here any more. cur_char already advanced past
+            # this round's conv.sep, so round_end counts it; the old
+            # `cur_len += sep_len` existed only because round_len was measured
+            # on a span that split() had stripped the separator from.
+        target[cur_len:] = IGNORE_INDEX
+
+        if cur_len < tokenizer.model_max_length:
+            # Round-length accounting is a reconstruct-and-retokenize
+            # approximation, not a true offset mapping. Some tokenizers
+            # (confirmed: TinyLlama's) have a per-round BOS-handling quirk
+            # relative to vicuna's that costs ~1 extra token PER ROUND, not a
+            # single fixed amount -- empirically confirmed as +1/round across
+            # multiple real multi-turn samples. A fixed tolerance therefore
+            # either fails long conversations (too tight) or stops catching
+            # real corruption like a dropped round (too loose). Scale with
+            # the number of rounds actually processed (`i`) instead: a
+            # genuinely dropped/misparsed round loses that round's full
+            # content (typically tens of tokens minimum), which still safely
+            # exceeds this margin, while the benign per-round drift never does.
+            MISMATCH_TOLERANCE = 2 + 2 * i
+            if abs(cur_len - total_len) > MISMATCH_TOLERANCE:
+                target[:] = IGNORE_INDEX
+                print(
+                    f"WARNING: tokenization mismatch: {cur_len} vs. {total_len}."
+                    f" (ignored)"
+                )
+
+    return dict(
+        input_ids=input_ids,
+        labels=targets,
+    )
+
+
+def preprocess_plain(
+    sources: Sequence[str],
+    tokenizer: transformers.PreTrainedTokenizer,
+) -> Dict:
+    # add end signal and concatenate together
+    conversations = []
+    for source in sources:
+        assert len(source) == 2
+        assert DEFAULT_IMAGE_TOKEN in source[0]['value']
+        source[0]['value'] = DEFAULT_IMAGE_TOKEN
+        conversation = source[0]['value'] + source[1]['value'] + conversation_lib.default_conversation.sep
+        conversations.append(conversation)
+    # tokenize conversations
+    input_ids = [tokenizer_image_token(prompt, tokenizer, return_tensors='pt') for prompt in conversations]
+    targets = copy.deepcopy(input_ids)
+    for target, source in zip(targets, sources):
+        tokenized_len = len(tokenizer_image_token(source[0]['value'], tokenizer))
+        target[:tokenized_len] = IGNORE_INDEX
+
+    return dict(input_ids=input_ids, labels=targets)
+
+
+def preprocess(
+    sources: Sequence[str],
+    tokenizer: transformers.PreTrainedTokenizer,
+    has_image: bool = False
+) -> Dict:
+    """
+    Given a list of sources, each is a conversation list. This transform:
+    1. Add signal '### ' at the beginning each sentence, with end signal '\n';
+    2. Concatenate conversations together;
+    3. Tokenize the concatenated conversation;
+    4. Make a deepcopy as the target. Mask human words with IGNORE_INDEX.
+    """
+    # Dispatch on sep_style (what preprocess_v1/preprocess_mpt actually assert
+    # against), not the arbitrary `version` string name. Conversation templates
+    # like chatml/phi share sep_style with v1/mpt but have their own `version`
+    # names, which used to fall through to the generic fallback below -- that
+    # fallback never emits the template's real turn-end token (e.g. chatml's
+    # <|im_end|>), so every model trained with a non-"v1"/non-"mpt" version
+    # string learned a mangled prompt format it was never evaluated with.
+    if conversation_lib.default_conversation.sep_style == conversation_lib.SeparatorStyle.PLAIN:
+        return preprocess_plain(sources, tokenizer)
+    if conversation_lib.default_conversation.sep_style == conversation_lib.SeparatorStyle.LLAMA_2:
+        return preprocess_llama_2(sources, tokenizer, has_image=has_image)
+    if conversation_lib.default_conversation.sep_style == conversation_lib.SeparatorStyle.TWO:
+        return preprocess_v1(sources, tokenizer, has_image=has_image)
+    if conversation_lib.default_conversation.sep_style == conversation_lib.SeparatorStyle.MPT:
+        return preprocess_mpt(sources, tokenizer, has_image=has_image)
+    # add end signal and concatenate together
+    conversations = []
+    for source in sources:
+        header = f"{conversation_lib.default_conversation.system}\n\n"
+        conversation = _add_speaker_and_signal(header, source)
+        conversations.append(conversation)
+    # tokenize conversations
+    def get_tokenize_len(prompts):
+        return [len(tokenizer_image_token(prompt, tokenizer)) for prompt in prompts]
+
+    if has_image:
+        input_ids = [tokenizer_image_token(prompt, tokenizer, return_tensors='pt') for prompt in conversations]
+    else:
+        conversations_tokenized = _tokenize_fn(conversations, tokenizer)
+        input_ids = conversations_tokenized["input_ids"]
+
+    targets = copy.deepcopy(input_ids)
+    for target, source in zip(targets, sources):
+        if has_image:
+            tokenized_lens = get_tokenize_len([header] + [s["value"] for s in source])
+        else:
+            tokenized_lens = _tokenize_fn([header] + [s["value"] for s in source], tokenizer)["input_ids_lens"]
+        speakers = [sentence["from"] for sentence in source]
+        _mask_targets(target, tokenized_lens, speakers)
+
+    return dict(input_ids=input_ids, labels=targets)
+
+
+class LazySupervisedDataset(Dataset):
+    """Dataset for supervised fine-tuning."""
+
+    def __init__(self, data_path: str,
+                 tokenizer: transformers.PreTrainedTokenizer,
+                 data_args: DataArguments):
+        super(LazySupervisedDataset, self).__init__()
+        list_data_dict = json.load(open(data_path, "r"))
+
+        rank0_print("Formatting inputs...Skip in lazy mode")
+        self.tokenizer = tokenizer
+        self.list_data_dict = list_data_dict
+        self.data_args = data_args
+
+    def __len__(self):
+        return len(self.list_data_dict)
+
+    @property
+    def lengths(self):
+        length_list = []
+        for sample in self.list_data_dict:
+            img_tokens = 128 if 'image' in sample else 0
+            length_list.append(sum(len(conv['value'].split()) for conv in sample['conversations']) + img_tokens)
+        return length_list
+
+    @property
+    def modality_lengths(self):
+        length_list = []
+        for sample in self.list_data_dict:
+            cur_len = sum(len(conv['value'].split()) for conv in sample['conversations'])
+            cur_len = cur_len if 'image' in sample else -cur_len
+            length_list.append(cur_len)
+        return length_list
+
+    def __getitem__(self, i) -> Dict[str, torch.Tensor]:
+        # Some datasets (e.g. ocr_vqa) ship with a handful of missing/corrupt
+        # image files. Rather than let one bad sample kill a multi-hour run,
+        # fall back to a different random sample and keep going.
+        for _ in range(10):
+            try:
+                return self._get_item(i)
+            except (FileNotFoundError, OSError) as e:
+                rank0_print(f"[warn] skipping sample {i} ({self.list_data_dict[i].get('image')}): {e}")
+                i = random.randint(0, len(self.list_data_dict) - 1)
+        raise RuntimeError("Too many consecutive unreadable samples")
+
+    def _get_item(self, i) -> Dict[str, torch.Tensor]:
+        sources = self.list_data_dict[i]
+        if isinstance(i, int):
+            sources = [sources]
+        assert len(sources) == 1, "Don't know why it is wrapped to a list"  # FIXME
+        if 'image' in sources[0]:
+            image_file = self.list_data_dict[i]['image']
+            image_folder = self.data_args.image_folder
+            processor = self.data_args.image_processor
+            image = Image.open(os.path.join(image_folder, image_file)).convert('RGB')
+            if self.data_args.image_aspect_ratio == 'pad':
+                def expand2square(pil_img, background_color):
+                    width, height = pil_img.size
+                    if width == height:
+                        return pil_img
+                    elif width > height:
+                        result = Image.new(pil_img.mode, (width, width), background_color)
+                        result.paste(pil_img, (0, (width - height) // 2))
+                        return result
+                    else:
+                        result = Image.new(pil_img.mode, (height, height), background_color)
+                        result.paste(pil_img, ((height - width) // 2, 0))
+                        return result
+                image = expand2square(image, tuple(int(x*255) for x in processor.image_mean))
+                image = processor.preprocess(image, return_tensors='pt')['pixel_values'][0]
+            else:
+                image = processor.preprocess(image, return_tensors='pt')['pixel_values'][0]
+            sources = preprocess_multimodal(
+                copy.deepcopy([e["conversations"] for e in sources]),
+                self.data_args)
+        else:
+            sources = copy.deepcopy([e["conversations"] for e in sources])
+        data_dict = preprocess(
+            sources,
+            self.tokenizer,
+            has_image=('image' in self.list_data_dict[i]))
+        if isinstance(i, int):
+            data_dict = dict(input_ids=data_dict["input_ids"][0],
+                             labels=data_dict["labels"][0])
+
+        # image exist in the data
+        if 'image' in self.list_data_dict[i]:
+            data_dict['image'] = image
+        elif self.data_args.is_multimodal:
+            # image does not exist in the data, but the model is multimodal.
+            # CLIPImageProcessor exposes crop_size; SiglipImageProcessor has no
+            # crop step and exposes size instead ({'height','width'}, same shape).
+            image_processor = self.data_args.image_processor
+            crop_size = getattr(image_processor, 'crop_size', None) or image_processor.size
+            data_dict['image'] = torch.zeros(3, crop_size['height'], crop_size['width'])
+        return data_dict
+
+
+@dataclass
+class DataCollatorForSupervisedDataset(object):
+    """Collate examples for supervised fine-tuning."""
+
+    tokenizer: transformers.PreTrainedTokenizer
+
+    def __call__(self, instances: Sequence[Dict]) -> Dict[str, torch.Tensor]:
+        input_ids, labels = tuple([instance[key] for instance in instances]
+                                  for key in ("input_ids", "labels"))
+        input_ids = torch.nn.utils.rnn.pad_sequence(
+            input_ids,
+            batch_first=True,
+            padding_value=self.tokenizer.pad_token_id)
+        labels = torch.nn.utils.rnn.pad_sequence(labels,
+                                                 batch_first=True,
+                                                 padding_value=IGNORE_INDEX)
+        input_ids = input_ids[:, :self.tokenizer.model_max_length]
+        labels = labels[:, :self.tokenizer.model_max_length]
+        batch = dict(
+            input_ids=input_ids,
+            labels=labels,
+            attention_mask=input_ids.ne(self.tokenizer.pad_token_id),
+        )
+
+        if 'image' in instances[0]:
+            images = [instance['image'] for instance in instances]
+            if all(x is not None and x.shape == images[0].shape for x in images):
+                batch['images'] = torch.stack(images)
+            else:
+                batch['images'] = images
+
+        return batch
+
+
+def make_supervised_data_module(tokenizer: transformers.PreTrainedTokenizer,
+                                data_args) -> Dict:
+    """Make dataset and collator for supervised fine-tuning."""
+    train_dataset = LazySupervisedDataset(tokenizer=tokenizer,
+                                data_path=data_args.data_path,
+                                data_args=data_args)
+    data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer)
+    return dict(train_dataset=train_dataset,
+                eval_dataset=None,
+                data_collator=data_collator)
+
+
+ELASTIC_CONFIG = None  # set by train_elastic.py launcher
+
+
+class ElasticConfigSaver(transformers.TrainerCallback):
+    """Write elastic_config.json into each intermediate checkpoint directory.
+
+    The end-of-run save (bottom of train()) only covers output_dir itself. A
+    run that is still going, was cancelled, or hit the time limit leaves
+    checkpoint-N/ directories that eval and the debug/ scripts cannot load,
+    because attach_elastic_engine has no way to know tok_levels,
+    num_query_tokens, use_pos_embed, pos_embed_type, or the LoRA ranks.
+    """
+
+    def __init__(self, cfg):
+        self.cfg = cfg
+
+    def on_save(self, args, state, control, **kwargs):
+        if args.local_rank not in (-1, 0):
+            return
+        import dataclasses as _dc
+        ckpt_dir = os.path.join(args.output_dir, f"checkpoint-{state.global_step}")
+        if not os.path.isdir(ckpt_dir):
+            return
+        try:
+            with open(os.path.join(ckpt_dir, "elastic_config.json"), "w") as f:
+                json.dump(_dc.asdict(self.cfg), f, indent=2)
+        except OSError as e:      # never let a metadata write kill a training run
+            rank0_print(f"[elastic] could not write elastic_config.json to {ckpt_dir}: {e}")
+
+# Maps HuggingFace model_type → LlavaXxxForCausalLM class.
+# TinyLlama and SmolLM2 use model_type="llama" and are covered by LlavaLlamaForCausalLM.
+# Add new entries here when adding a new backbone file.
+_LLM_TYPE_TO_LLAVA_CLS = {
+    "llama":     "LlavaLlamaForCausalLM",
+    "llava":     "LlavaLlamaForCausalLM",   # liuhaotian/llava-v1.5-7b uses model_type='llava'
+    "qwen2":     "LlavaQwenForCausalLM",
+    "phi":       "LlavaPhiForCausalLM",
+    "phi3":      "LlavaPhi3ForCausalLM",
+    "stablelm":  "LlavaStableLMForCausalLM",
+    # llava_* → loaded from a saved FlexLLaVA checkpoint via AutoModelForCausalLM
+}
+
+
+def _build_llava_model(model_name_or_path, **kwargs):
+    """Peek at the HF config's model_type and return the matching LlavaXxx model."""
+    import transformers as _tf
+    from llava.model import (
+        LlavaLlamaForCausalLM,
+        LlavaQwenForCausalLM,
+        LlavaPhiForCausalLM,
+        LlavaPhi3ForCausalLM,
+        LlavaStableLMForCausalLM,
+    )
+    _cls_map = {
+        "llama":    LlavaLlamaForCausalLM,
+        "llava":    LlavaLlamaForCausalLM,
+        "qwen2":    LlavaQwenForCausalLM,
+        "phi":      LlavaPhiForCausalLM,
+        "phi3":     LlavaPhi3ForCausalLM,
+        "stablelm": LlavaStableLMForCausalLM,
+    }
+    cfg = _tf.AutoConfig.from_pretrained(
+        model_name_or_path, cache_dir=kwargs.get("cache_dir"), trust_remote_code=False)
+    model_type = cfg.model_type
+    if model_type.startswith("llava_"):
+        # Resume from a previously saved FlexLLaVA checkpoint.
+        return _tf.AutoModelForCausalLM.from_pretrained(model_name_or_path, **kwargs)
+    cls = _cls_map.get(model_type)
+    if cls is None:
+        raise ValueError(
+            f"Unsupported base LLM model_type={model_type!r} at {model_name_or_path}.\n"
+            f"Supported: {list(_cls_map)}. "
+            f"Add a llava_<backbone>.py and register it in _LLM_TYPE_TO_LLAVA_CLS.")
+    rank0_print(f"[FlexLLaVA] detected model_type={model_type!r} → {cls.__name__}")
+    return cls.from_pretrained(model_name_or_path, **kwargs)
+
+
+def train(attn_implementation=None):
+    global local_rank
+
+    parser = transformers.HfArgumentParser(
+        (ModelArguments, DataArguments, TrainingArguments))
+    model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+    local_rank = training_args.local_rank
+    compute_dtype = (torch.float16 if training_args.fp16 else (torch.bfloat16 if training_args.bf16 else torch.float32))
+
+    bnb_model_from_pretrained_args = {}
+    if training_args.bits in [4, 8]:
+        from transformers import BitsAndBytesConfig
+        bnb_model_from_pretrained_args.update(dict(
+            device_map={"": training_args.device},
+            load_in_4bit=training_args.bits == 4,
+            load_in_8bit=training_args.bits == 8,
+            quantization_config=BitsAndBytesConfig(
+                load_in_4bit=training_args.bits == 4,
+                load_in_8bit=training_args.bits == 8,
+                llm_int8_skip_modules=["mm_projector"],
+                llm_int8_threshold=6.0,
+                llm_int8_has_fp16_weight=False,
+                bnb_4bit_compute_dtype=compute_dtype,
+                bnb_4bit_use_double_quant=training_args.double_quant,
+                bnb_4bit_quant_type=training_args.quant_type # {'fp4', 'nf4'}
+            )
+        ))
+
+    if model_args.vision_tower is not None:
+        if 'mpt' in model_args.model_name_or_path:
+            config = transformers.AutoConfig.from_pretrained(model_args.model_name_or_path, trust_remote_code=True)
+            config.attn_config['attn_impl'] = training_args.mpt_attn_impl
+            model = LlavaMptForCausalLM.from_pretrained(
+                model_args.model_name_or_path,
+                config=config,
+                cache_dir=training_args.cache_dir,
+                **bnb_model_from_pretrained_args
+            )
+        else:
+            model = _build_llava_model(
+                model_args.model_name_or_path,
+                cache_dir=training_args.cache_dir,
+                attn_implementation=attn_implementation,
+                torch_dtype=(torch.bfloat16 if training_args.bf16 else None),
+                **bnb_model_from_pretrained_args
+            )
+    else:
+        model = transformers.AutoModelForCausalLM.from_pretrained(
+            model_args.model_name_or_path,
+            cache_dir=training_args.cache_dir,
+            attn_implementation=attn_implementation,
+            torch_dtype=(torch.bfloat16 if training_args.bf16 else None),
+            **bnb_model_from_pretrained_args
+        )
+
+    # Some base checkpoints (e.g. lmsys/vicuna-7b-v1.5) ship a generation_config
+    # with do_sample=False alongside leftover sample-only fields (temperature,
+    # top_p) from an older HF convention. Newer transformers versions treat
+    # that combination as an outright error (not just a warning) when
+    # save_pretrained() validates the config -- which crashes training the
+    # first time it tries to save a checkpoint, well after training itself
+    # has been running fine. Clear the now-irrelevant fields up front so later
+    # saves don't hit invalid state.
+    if getattr(model.generation_config, "do_sample", True) is False:
+        for _field in ("temperature", "top_p", "top_k"):
+            if getattr(model.generation_config, _field, None) is not None:
+                setattr(model.generation_config, _field, None)
+
+    matryoshka_vis_token_scale = getattr(model_args, 'matryoshka_vis_token_scale', None)
+    model.model.config.matryoshka_vis_token_scale = list_of_integers(matryoshka_vis_token_scale)
+    model.config.use_cache = False
+
+    if model_args.freeze_backbone:
+        model.model.requires_grad_(False)
+
+    if training_args.bits in [4, 8]:
+        from peft import prepare_model_for_kbit_training
+        model.config.torch_dtype=(torch.float32 if training_args.fp16 else (torch.bfloat16 if training_args.bf16 else torch.float32))
+        model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=training_args.gradient_checkpointing)
+
+    if training_args.gradient_checkpointing:
+        if hasattr(model, "enable_input_require_grads"):
+            model.enable_input_require_grads()
+        else:
+            def make_inputs_require_grad(module, input, output):
+                output.requires_grad_(True)
+            model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
+
+    if training_args.lora_enable:
+        from peft import LoraConfig, get_peft_model
+        lora_config = LoraConfig(
+            r=training_args.lora_r,
+            lora_alpha=training_args.lora_alpha,
+            target_modules=find_all_linear_names(model),
+            lora_dropout=training_args.lora_dropout,
+            bias=training_args.lora_bias,
+            task_type="CAUSAL_LM",
+        )
+        if training_args.bits == 16:
+            if training_args.bf16:
+                model.to(torch.bfloat16)
+            if training_args.fp16:
+                model.to(torch.float16)
+        rank0_print("Adding LoRA adapters...")
+        model = get_peft_model(model, lora_config)
+
+    if 'mpt' in model_args.model_name_or_path:
+        tokenizer = transformers.AutoTokenizer.from_pretrained(
+            model_args.model_name_or_path,
+            cache_dir=training_args.cache_dir,
+            model_max_length=training_args.model_max_length,
+            padding_side="right"
+        )
+    else:
+        tokenizer = transformers.AutoTokenizer.from_pretrained(
+            model_args.model_name_or_path,
+            cache_dir=training_args.cache_dir,
+            model_max_length=training_args.model_max_length,
+            padding_side="right",
+            use_fast=False,
+        )
+
+    if model_args.version == "v0":
+        if tokenizer.pad_token is None:
+            smart_tokenizer_and_embedding_resize(
+                special_tokens_dict=dict(pad_token="[PAD]"),
+                tokenizer=tokenizer,
+                model=model,
+            )
+    elif model_args.version == "v0.5":
+        tokenizer.pad_token = tokenizer.unk_token
+    else:
+        # Order matters: resolve the template, align eos to the terminator it
+        # actually writes, THEN separate pad from eos -- the pad guard compares
+        # against eos, so it has to run against the final value.
+        if model_args.version in conversation_lib.conv_templates:
+            conversation_lib.default_conversation = conversation_lib.conv_templates[model_args.version]
+        else:
+            conversation_lib.default_conversation = conversation_lib.conv_templates["vicuna_v1"]
+
+        align_eos_with_template(tokenizer, conversation_lib.default_conversation, model)
+
+        # Applies to every backbone family. A no-op for Llama/Vicuna (no
+        # pad_token -> unk, already distinct from eos); fires for chat SLMs
+        # like TinyLlama that ship pad_token == eos_token, where it prevents
+        # every EOS being stripped from the labels. See the docstring.
+        ensure_distinct_pad_token(tokenizer, model)
+
+    if model_args.vision_tower is not None:
+        model.get_model().initialize_vision_modules(
+            model_args=model_args,
+            fsdp=training_args.fsdp
+        )
+        
+        vision_tower = model.get_vision_tower()
+        vision_tower.to(dtype=torch.bfloat16 if training_args.bf16 else torch.float16, device=training_args.device)
+
+        data_args.image_processor = vision_tower.image_processor
+        data_args.is_multimodal = True
+
+        model.config.image_aspect_ratio = data_args.image_aspect_ratio
+        model.config.tokenizer_padding_side = tokenizer.padding_side
+        model.config.tokenizer_model_max_length = tokenizer.model_max_length
+
+        model.config.tune_mm_mlp_adapter = training_args.tune_mm_mlp_adapter = model_args.tune_mm_mlp_adapter
+        if model_args.tune_mm_mlp_adapter:
+            model.requires_grad_(False)
+            for p in model.get_model().mm_projector.parameters():
+                p.requires_grad = True
+
+        model.config.freeze_mm_mlp_adapter = training_args.freeze_mm_mlp_adapter
+        if training_args.freeze_mm_mlp_adapter:
+            for p in model.get_model().mm_projector.parameters():
+                p.requires_grad = False
+                
+        model.config.unfreeze_mm_vision_tower = model_args.unfreeze_mm_vision_tower or getattr(model.config, 'unfreeze_mm_vision_tower', False)
+        if model_args.unfreeze_mm_vision_tower:
+            vision_tower.requires_grad_(True)
+            
+        if training_args.bits in [4, 8]:
+            model.get_model().mm_projector.to(dtype=compute_dtype, device=training_args.device)
+
+        model.config.mm_use_im_start_end = data_args.mm_use_im_start_end = model_args.mm_use_im_start_end
+        model.config.mm_projector_lr = training_args.mm_projector_lr
+        model.config.mm_vision_tower_lr = training_args.mm_vision_tower_lr
+        training_args.use_im_start_end = model_args.mm_use_im_start_end
+        model.config.mm_use_im_patch_token = model_args.mm_use_im_patch_token
+        model.initialize_vision_tokenizer(model_args, tokenizer=tokenizer)
+
+    if training_args.bits in [4, 8]:
+        from peft.tuners.lora import LoraLayer
+        for name, module in model.named_modules():
+            if isinstance(module, LoraLayer):
+                if training_args.bf16:
+                    module = module.to(torch.bfloat16)
+            if 'norm' in name:
+                module = module.to(torch.float32)
+            if 'lm_head' in name or 'embed_tokens' in name:
+                if hasattr(module, 'weight'):
+                    if training_args.bf16 and module.weight.dtype == torch.float32:
+                        module = module.to(torch.bfloat16)
+
+    # --- Elastic (Adaptive Matryoshka) attach hook ------------------------
+    if ELASTIC_CONFIG is not None:
+        from llava.model.elastic import attach_elastic_engine
+        attach_elastic_engine(model, ELASTIC_CONFIG)
+        # ensure the elastic training branch fires (it checks engine, not this,
+        # but eval/generate read the config scale list)
+        model.config.matryoshka_vis_token_scale = list(range(len(ELASTIC_CONFIG.tok_levels)))
+        # train ONLY the elastic modules + LoRA; base ViT and LLM stay frozen
+        for n, p in model.named_parameters():
+            if any(k in n for k in ("elastic_resampler", "elastic_projector",
+                                    "lora_A", "lora_B")):
+                p.requires_grad_(True)
+        rank0_print(f"[elastic] engine attached: token_reduction="
+                    f"{ELASTIC_CONFIG.token_reduction}, use_lora={ELASTIC_CONFIG.use_lora}")
+        if getattr(model_args, "pretrain_elastic_path", None):
+            _load_elastic_pretrain_weights(model, model_args.pretrain_elastic_path)
+        # mm_projector is bypassed by encode_images when elastic_engine is active;
+        # drop it before DeepSpeed/Trainer init so its ~8M params free GPU memory.
+        base = model.get_model()
+        if hasattr(base, "mm_projector"):
+            del base.mm_projector
+            torch.cuda.empty_cache()
+            rank0_print("[elastic] dropped base mm_projector (~8M params freed)")
+
+    data_module = make_supervised_data_module(tokenizer=tokenizer,
+                                              data_args=data_args)
+    trainer = LLaVATrainer(model=model,
+                    tokenizer=tokenizer,
+                    args=training_args,
+                    **data_module)
+
+    # Make every intermediate checkpoint self-describing. Without this,
+    # elastic_config.json exists only in the final output dir, so a
+    # checkpoint-N/ cannot be evaluated or diagnosed without hand-rebuilding
+    # the config -- which is what had to be done to inspect run 26573's
+    # checkpoint-1500 mid-run.
+    if ELASTIC_CONFIG is not None:
+        trainer.add_callback(ElasticConfigSaver(ELASTIC_CONFIG))
+
+
+    for names, p in model.named_parameters():
+        if p.requires_grad:
+            rank0_print(names, "requires_grad")
+            
+    if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
+        trainer.train(resume_from_checkpoint=True)
+    else:
+        trainer.train()
+    trainer.save_state()
+
+    # Persist elastic config so eval scripts can re-attach the engine without
+    # re-specifying all hyperparameters.
+    if ELASTIC_CONFIG is not None:
+        import json as _json
+        import dataclasses as _dc
+        if training_args.local_rank in (-1, 0):
+            _cfg_path = os.path.join(training_args.output_dir, "elastic_config.json")
+            _json.dump(_dc.asdict(ELASTIC_CONFIG), open(_cfg_path, "w"), indent=2)
+            rank0_print(f"[elastic] saved elastic_config.json to {training_args.output_dir}")
+
+    model.config.use_cache = True
+
+    if training_args.lora_enable:
+        # Full state dict (frozen backbone + every trained param, including the
+        # vision-tower NestedLoRALinear's lora_A/lora_B -- see
+        # get_full_state_dict_maybe_zero_3). This is a self-contained
+        # checkpoint, matching what load_pretrained_model + attach_elastic_engine
+        # expect on the eval side (same format the non-LoRA/pretrain stage
+        # already saves). Deliberately NOT saved as a PEFT adapter
+        # (model.save_pretrained + adapter_config.json): transformers'
+        # from_pretrained auto-detects adapter_config.json and loads the base
+        # model from its base_model_name_or_path (the raw HF Hub checkpoint,
+        # no vision tower at all) instead of this directory, silently
+        # discarding everything trained in this run.
+        #
+        # The LLM LoRA must be MERGED first. Stripping only the outer
+        # "base_model.model." prefix leaves PEFT's inner module structure
+        # intact -- `...down_proj.base_layer.weight` plus `.lora_A.default.` /
+        # `.lora_B.default.` -- while from_pretrained looks for a plain
+        # `...down_proj.weight`, finds nothing, and RANDOMLY INITIALISES every
+        # transformer layer. Run 26571 trained cleanly (loss 0.72, max
+        # grad_norm 4.60) and then emitted "elledelledelled" at eval for
+        # exactly this reason; debug/merge_lora_checkpoint.py exists to repair
+        # checkpoints written before this fix.
+        full_state_dict = get_full_state_dict_maybe_zero_3(model.named_parameters())
+        prefix = "base_model.model."
+        full_state_dict = {
+            (k[len(prefix):] if k.startswith(prefix) else k): v
+            for k, v in full_state_dict.items()
+        }
+        full_state_dict = _merge_lora_state_dict(
+            full_state_dict,
+            scale=training_args.lora_alpha / training_args.lora_r,
+        )
+
+        if training_args.local_rank == 0 or training_args.local_rank == -1:
+            model.config.save_pretrained(training_args.output_dir)
+            torch.save(full_state_dict, os.path.join(training_args.output_dir, 'pytorch_model.bin'))
+            tokenizer.save_pretrained(training_args.output_dir)
+    else:
+        safe_save_model_for_hf_trainer(trainer=trainer,
+                                       output_dir=training_args.output_dir)
+
+
+if __name__ == "__main__":
+    train()

@@ -1,0 +1,212 @@
+#!/bin/bash
+# Stage 1 — Elastic Feature Alignment for Small LLM Backbones
+#
+# Usage:
+#   bash scripts/v1_5/pretrain_elastic_slm.sh <LLM_KEY>
+#
+# LLM_KEY choices:
+#   --- 3 SLMs from the reference repos ---
+#   tinyllama      → TinyLlama/TinyLlama-1.1B-Chat-v1.0      (TinyLLaVA repo, conv: v1)
+#   mobilellama    → mtgv/MobileLLaMA-1.4B-Chat               (MobileVLM repo, conv: v1)
+#   smollm2        → HuggingFaceTB/SmolLM2-1.7B-Instruct     (SmolLM repo,    conv: chatml)
+#   --- additional Qwen2.5 / Phi-2 / StableLM variants ---
+#   qwen0.5b       → Qwen/Qwen2.5-0.5B-Instruct   (conv: chatml)
+#   qwen1.5b       → Qwen/Qwen2.5-1.5B-Instruct   (conv: chatml)
+#   qwen3b         → Qwen/Qwen2.5-3B-Instruct      (conv: chatml)
+#   phi2           → microsoft/phi-2               (conv: phi)
+#   stablelm       → stabilityai/stablelm-2-zephyr-1_6b  (conv: chatml)
+#
+# Stage 1 freezes the LLM and ViT; only elastic_resampler, elastic_projector,
+# lora_A, lora_B are trained.  ZeRO-2 is sufficient since frozen params need
+# no gradient sharding.
+#
+# ── v5 (2026-08-31): vision_lora_enable turned on as the next ablation arm ──
+# v4 (and both otter runs) deliberately ran with --vision_lora_enable False,
+# ablating the ONLY mechanism that lets the vision tower adapt differently
+# per tok_level (llava/model/elastic/nested_lora.py) -- with it off, the
+# frozen CLIP tower runs identically at every level and only the resampler's
+# output length changes. Every backbone tested under that ablation
+# (tinyllama, phi2, smollm2) showed ~0 accuracy delta between 256 and 16
+# visual tokens. v5 flips this True to test whether rank-nested vision LoRA
+# is what was missing. Treat v4 vs v5 as a controlled A/B on this one flag.
+#
+# ── 2026-09-09: that A/B RESOLVED AGAINST rank-nested vision LoRA; the
+# default is back to False ────────────────────────────────────────────────
+# v5 lost to v4 on every benchmark, on BOTH backbones it was run on
+# (TinyLlama: MME -78, TextVQA -4.6, GQA -1.4, POPE -2.2 at 256 tok;
+# SmolLM2: SciQA -9.9, MME -39, TextVQA -3.4), and it did NOT buy the
+# elasticity it was hypothesised to -- v5's 256-vs-16 spread was FLATTER than
+# v4's on every metric. Rank-nested vision LoRA is a net regression, so it is
+# off by default from v9 onward and every future run inherits that. See
+# docs/EXPERIMENT_JOURNAL.md section 16.
+#
+# VISION_LORA_ENABLE / VISION_LORA_SPECIALIZE_TOK are env-overridable so a run
+# can opt back in deliberately. The v10 recipe uses a single SHARED rank-16
+# adapter (VISION_LORA_ENABLE=True VISION_LORA_SPECIALIZE_TOK=False with
+# lora_ranks ending at 16) -- that is a different mechanism from v5's
+# per-level nested ranks, and is the only sanctioned way to have vision LoRA
+# on. Whatever these are set to here MUST match finetune_elastic_slm.sh, or
+# Stage 2 warm-starts from a checkpoint with the wrong adapter buffer.
+#
+# ── v5 follow-up (2026-08-31): --lora_ranks must end at Stage 2's max rank,
+# not Stage 1's rank ─────────────────────────────────────────────────────
+# NestedLoRALinear allocates lora_A/lora_B at max(lora_ranks) ONCE, at
+# construction (nested_lora.py) -- current_rank just slices a prefix of that
+# fixed buffer at runtime, it never resizes it. Stage 1 has one tok_level, so
+# --lora_ranks must have exactly one entry (train_elastic.py requires
+# len(lora_ranks) == len(tok_levels)) -- but that one entry sets the buffer
+# width for the WHOLE adapter, which Stage 2 then warm-starts from at its own
+# max rank (64, from --lora_ranks 8 16 32 64). Job 27267 was pretrained with
+# --lora_ranks 8 here (buffer width 8) and crashed at Stage-2 warm-start with
+# "size mismatch ... torch.Size([8, 1024]) ... current model is
+# torch.Size([64, 1024])" on every vision-tower LoRA key -- no training step
+# ever ran. Fixed: this must always be the SAME max rank as the finetune
+# script's --lora_ranks, i.e. 64 (the specific rank VALUE barely matters here
+# since Stage 1 only ever exercises tok_level index 0 -> lora_ranks[0]
+# regardless of what that value is; what matters is the buffer WIDTH matching
+# Stage 2's). If you ever change finetune_elastic_slm.sh's --lora_ranks max,
+# change this to match, or Stage 2 will fail at warm-start again.
+
+LLM_KEY=${1:-"qwen0.5b"}
+
+case "$LLM_KEY" in
+  qwen0.5b)
+    MODEL_PATH="Qwen/Qwen2.5-0.5B-Instruct"
+    CONV_VERSION="chatml"
+    ;;
+  qwen1.5b)
+    MODEL_PATH="Qwen/Qwen2.5-1.5B-Instruct"
+    CONV_VERSION="chatml"
+    ;;
+  qwen3b)
+    MODEL_PATH="Qwen/Qwen2.5-3B-Instruct"
+    CONV_VERSION="chatml"
+    ;;
+  tinyllama)
+    MODEL_PATH="TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+    # v1 (vicuna-style USER/ASSISTANT + "</s>"), not chatml: TinyLlama's tokenizer
+    # never registered <|im_start|>/<|im_end|> as real special tokens, so they
+    # fragment into 7 context-dependent BPE pieces each -- this silently masked
+    # ~86% of finetune data's labels (see preprocess_mpt's round-length
+    # accounting, which assumes a fixed token cost per separator occurrence).
+    # "</s>" IS a real special token here, so preprocess_v1 has no such issue.
+    # Matches the reference TinyLLaVA_Factory's own llama_template.py for
+    # this exact model (vendored at ./TinyLLaVA_Factory in this repo).
+    CONV_VERSION="v1"
+    ;;
+  mobilellama)
+    MODEL_PATH="mtgv/MobileLLaMA-1.4B-Chat"
+    CONV_VERSION="v1"   # MobileLLaMA uses the standard Vicuna/LLaVA-v1 template
+    ;;
+  smollm2)
+    MODEL_PATH="HuggingFaceTB/SmolLM2-1.7B-Instruct"
+    CONV_VERSION="chatml"
+    ;;
+  phi2)
+    MODEL_PATH="microsoft/phi-2"
+    CONV_VERSION="phi"
+    ;;
+  phi3.5|phi3)
+    MODEL_PATH="microsoft/Phi-3.5-mini-instruct"
+    # NOT "phi": Phi-3.5 uses <|user|>...<|end|><|assistant|>, not Phi-2's
+    # Instruct:/Output:. All four markers are registered single tokens.
+    CONV_VERSION="phi3"
+    ;;
+  stablelm)
+    MODEL_PATH="stabilityai/stablelm-2-zephyr-1_6b"
+    CONV_VERSION="chatml"
+    ;;
+  *)
+    echo "Unknown LLM_KEY='$LLM_KEY'. Choose one of: tinyllama mobilellama smollm2 qwen0.5b qwen1.5b qwen3b phi2 phi3.5 stablelm"
+    exit 1
+    ;;
+esac
+
+# Optional run tag, e.g.  ELASTIC_RUN_TAG=outnorm sbatch run_job_pretrain_slm.sh
+# Suffixes the checkpoint/log dirs so a variant run does not overwrite the
+# untagged baseline. Stage 2 reads the same variable to find its warm-start.
+TAG="${ELASTIC_RUN_TAG:+-${ELASTIC_RUN_TAG}}"
+
+OUTPUT_DIR="/var/scratch/skalra/flexllava/checkpoints/elastic-pretrain-${LLM_KEY}${TAG}"
+LOG_DIR="/var/scratch/skalra/flexllava/logs/elastic-pretrain-${LLM_KEY}${TAG}"
+RUN_NAME="elastic-pretrain-${LLM_KEY}-tok256-144-64-16${TAG}"
+
+# Single-GPU nodes: NUM_GPUS=1 GRAD_ACCUM=16 keeps the effective batch
+# identical (per_device * accum * gpus). Changing NUM_GPUS alone would
+# silently halve it and make the run non-comparable.
+NUM_GPUS="${NUM_GPUS:-2}"
+# Derive accumulation so the effective batch (per_device * accum * gpus)
+# is invariant to NUM_GPUS. Setting NUM_GPUS alone would otherwise halve
+# it on a 1-GPU node and make the run non-comparable.
+GRAD_ACCUM="${GRAD_ACCUM:-$(( 8 * 2 / NUM_GPUS ))}"
+echo "[FlexLLaVA] num_gpus=${NUM_GPUS}  grad_accum=${GRAD_ACCUM}  (effective batch unchanged)"
+echo "[FlexLLaVA] Pretrain  LLM=${MODEL_PATH}  conv=${CONV_VERSION}"
+echo "[FlexLLaVA] Output → ${OUTPUT_DIR}"
+
+# Overridable for experiments with a different token/rank grid -- e.g. the
+# extended-range experiment (16..576 tokens): match STAGE1_LORA_RANK to
+# whatever finetune_elastic_slm.sh's LORA_RANKS ends at, and STAGE1_TOK_LEVEL
+# to its first (largest) entry, or Stage 2's warm-start crashes exactly like
+# job 27267 did -- see the v5 follow-up comment above.
+STAGE1_TOK_LEVEL="${STAGE1_TOK_LEVEL:-256}"
+STAGE1_LORA_RANK="${STAGE1_LORA_RANK:-64}"
+echo "[FlexLLaVA] tok_level=${STAGE1_TOK_LEVEL}  lora_rank=${STAGE1_LORA_RANK}  (must match finetune's largest tok_level / max lora_rank)"
+echo "[FlexLLaVA] vision_lora_enable=${VISION_LORA_ENABLE:-False}  specialize_tok=${VISION_LORA_SPECIALIZE_TOK:-True}  (off by default since 2026-09-09; must match finetune_elastic_slm.sh)"
+
+deepspeed --num_gpus ${NUM_GPUS} llava/train/train_elastic.py \
+    --tok_levels ${STAGE1_TOK_LEVEL} \
+    --lora_ranks ${STAGE1_LORA_RANK} \
+    ${NEST_VERSION:+--nest_version ${NEST_VERSION}} \
+    --resampler_arch "${RESAMPLER_ARCH:-query}" \
+    --anchor_routing "${ANCHOR_ROUTING:-}" \
+    --anchor_mode "${ANCHOR_MODE:-ratio}" \
+    --anchor_ratio "${ANCHOR_RATIO:-0.25}" \
+    ${POOLING_MODE:+--pooling_mode ${POOLING_MODE}} \
+    ${NUM_ANCHORS:+--num_anchors ${NUM_ANCHORS}} \
+    --use_token_decorrelation "${USE_TOKEN_DECORRELATION:-False}" \
+    --decorr_weight "${DECORR_WEIGHT:-0.01}" \
+    --prefix_kl_weight 0.1 \
+    --vision_lora_enable "${VISION_LORA_ENABLE:-False}" \
+    --vision_lora_specialize_tok "${VISION_LORA_SPECIALIZE_TOK:-True}" \
+    --coral_weight 0.01 \
+    --use_pos_embed "${USE_POS_EMBED:-True}" \
+    --pos_embed_type "${POS_EMBED_TYPE:-learned}" \
+    --use_nested_dropout False \
+    --deepspeed ./scripts/zero2.json \
+    --model_name_or_path "${MODEL_PATH}" \
+    --cache_dir /var/scratch/skalra/.cache/huggingface/hub \
+    --version "${CONV_VERSION}" \
+    --data_path "${DATA_ROOT:-/var/scratch/skalra/flexllava/data}/LLaVA-Pretrain/blip_laion_cc_sbu_558k.json" \
+    --image_folder "${DATA_ROOT:-/var/scratch/skalra/flexllava/data}/LLaVA-Pretrain" \
+    --vision_tower "${VISION_TOWER:-openai/clip-vit-large-patch14-336}" \
+    --mm_projector_type mlp2x_gelu \
+    --mm_vision_select_layer -2 \
+    --mm_use_im_start_end False \
+    --mm_use_im_patch_token False \
+    --image_aspect_ratio square \
+    --freeze_backbone True \
+    --bf16 True \
+    --output_dir "${OUTPUT_DIR}" \
+    --num_train_epochs 1 \
+    ${MAX_STEPS:+--max_steps ${MAX_STEPS}} \
+    ${SEED:+--seed ${SEED}} \
+    --per_device_train_batch_size 16 \
+    --per_device_eval_batch_size 4 \
+    --gradient_accumulation_steps ${GRAD_ACCUM} \
+    --evaluation_strategy "no" \
+    --save_strategy "steps" \
+    --save_steps 500 \
+    --save_total_limit 1 \
+    --learning_rate 1e-3 \
+    --weight_decay 0. \
+    --warmup_ratio 0.03 \
+    --lr_scheduler_type "cosine" \
+    --logging_steps 1 \
+    --tf32 True \
+    --model_max_length 1024 \
+    --gradient_checkpointing True \
+    --dataloader_num_workers 16 \
+    --lazy_preprocess True \
+    --report_to wandb \
+    --run_name "${RUN_NAME}" \
+    --logging_dir "${LOG_DIR}"

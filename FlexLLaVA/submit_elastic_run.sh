@@ -1,0 +1,504 @@
+#!/bin/bash
+# Submit one named elastic experiment (Stage 1 + Stage 2 + its eval array).
+#
+#   bash submit_elastic_run.sh v9-parcel-decorr
+#   bash submit_elastic_run.sh v10-parcel-lora16
+#   DRY_RUN=1 bash submit_elastic_run.sh v10-parcel-lora16    # print, don't submit
+#
+# WHY THIS FILE EXISTS
+# --------------------
+# Runs used to be launched as bare `ELASTIC_RUN_TAG=... FOO=... sbatch
+# run_job_slm.sh tinyllama`, which puts the ENTIRE experiment definition in the
+# submitting shell's environment. SLURM propagates it via --export=ALL but does
+# not record it anywhere readable: `scontrol show job` shows only the command,
+# and once the shell is gone the recipe is unrecoverable. That is exactly what
+# happened to v9 (job 27376) -- reconstructing its token ladder needed the eval
+# array's --array=0-7 as circumstantial evidence. Every recipe now lives here,
+# in git, next to the results it produced.
+#
+# Each recipe is a full specification: anything NOT set falls through to the
+# launcher defaults in scripts/v1_5/{pretrain,finetune}_elastic_slm.sh, so
+# recipes state even the values that happen to match a default when that value
+# is load-bearing for the experiment.
+set -euo pipefail
+cd "$(dirname "$0")"
+
+RUN=${1:-}
+SLM_KEY=${SLM_KEY:-tinyllama}
+
+# ---- shared across every recipe below -------------------------------------
+# The 4-level ladder is v8's, and it is deliberate. v6-tokrange extended it to
+# 576 tokens and was a clear regression (TextVQA 14.8 at 576 tokens vs 41.0 for
+# the dense 576-token baseline, and flat across 576/512/448/384) -- see
+# docs/EXPERIMENT_JOURNAL.md section 16. Runs from v9 on stay on v8's grid so
+# they are directly comparable to the current best model.
+export TOK_LEVELS="256 144 64 16"
+export STAGE1_TOK_LEVEL=256
+export RESAMPLER_ARCH=pool_anchored     # PARCEL. The one change that has worked.
+export ANCHOR_MODE=ratio
+export ANCHOR_RATIO=0.25                # reproduces v8's anchor_routing 64/36/16/4
+export VISION_TOWER="openai/clip-vit-large-patch14-336"
+export TEACHER=self
+
+# Untyped `gpu:2`, NOT `gpu:A10:2` or `gpu:A40:2`. Only node205 (A40:2) and
+# node208 (A10:2) have two GPUs -- node206/207 have one each -- so gpu:2
+# already resolves to exactly those two nodes, and lets SLURM place a run on
+# whichever frees up first instead of queueing every run behind one node.
+# Safe for comparability: nothing in the TRAINING path branches on GPU type.
+# per_device_train_batch_size is a fixed constant in both stage scripts (16 /
+# 2) and NUM_GPUS defaults to 2 either way, so a run is identical on A40 and
+# A10 -- only wall-clock differs. (eval_lmms_level.sh DOES pick its eval batch
+# size by GPU type, but that changes throughput, not scores.) Both card types
+# have headroom: v8-parcel, which carries a heavier rank-64 nested adapter
+# than anything here, completed its full 84.5h run on node208's A10:2.
+#
+# Recipes may raise this (v12 needs an A40-class card for the frozen 7B
+# teacher), and `GRES=... bash submit_elastic_run.sh <recipe>` overrides both
+# -- which is how these recipes get run on the hipster cluster, whose card
+# names this script cannot know.
+DEFAULT_GRES="gpu:2"
+
+case "$RUN" in
+  v9-parcel-decorr)
+    # PARCEL + token decorrelation, vision LoRA OFF.
+    # Isolates the decorrelation term (section 13) against v8 on the same grid.
+    export ELASTIC_RUN_TAG=v9-parcel-decorr
+    export USE_TOKEN_DECORRELATION=True
+    export DECORR_WEIGHT=0.01
+    export VISION_LORA_ENABLE=False
+    # Inert while vision_lora_enable=False (no adapter is injected at all), but
+    # train_elastic.py still requires len(lora_ranks) == len(tok_levels).
+    export LORA_RANKS="8 16 32 64"
+    export STAGE1_LORA_RANK=64
+    ;;
+  v10-parcel-lora16)
+    # PARCEL + a single SHARED rank-16 vision-LoRA adapter, decorrelation OFF.
+    # v8's recipe with the vision LoRA changed from rank-nested-per-level to one
+    # fixed rank-16 adapter. specialize_tok=False makes ElasticConfig.
+    # lora_level_for_tok always return the LAST rank index, so every tok_level
+    # uses lora_ranks[-1] = 16, and NestedLoRALinear allocates its lora_A/lora_B
+    # buffer at max(lora_ranks) = 16 -- one adapter, one rank, no nesting.
+    # STAGE1_LORA_RANK must equal that 16 or Stage 2's warm-start hits the
+    # job-27267 size mismatch on every vision-tower LoRA key.
+    export ELASTIC_RUN_TAG=v10-parcel-lora16
+    export USE_TOKEN_DECORRELATION=False
+    export VISION_LORA_ENABLE=True
+    export VISION_LORA_SPECIALIZE_TOK=False
+    export LORA_RANKS="16 16 16 16"
+    export STAGE1_LORA_RANK=16
+    ;;
+  v11-parcel-nolora)
+    # PARCEL alone: decorrelation OFF, vision LoRA OFF.
+    # The control v8 never had, and the reason it matters: v8 is the best model
+    # in the project and it has vision LoRA ON, so "vision LoRA hurts" -- which
+    # rests entirely on v4-vs-v5, both on the plain `query` resampler -- has
+    # never been tested under PARCEL. v9 is the first PARCEL run without it but
+    # moves decorrelation at the same time, so it cannot isolate the flag.
+    # v11 vs v8 isolates vision LoRA; v11 vs v9 isolates decorrelation.
+    # See docs/EXPERIMENT_JOURNAL.md sections 16d (scope limit) and 16g.
+    export ELASTIC_RUN_TAG=v11-parcel-nolora
+    export USE_TOKEN_DECORRELATION=False
+    export VISION_LORA_ENABLE=False
+    # Inert while vision_lora_enable=False, but train_elastic.py still requires
+    # len(lora_ranks) == len(tok_levels). Same values as v9 so the two runs
+    # differ in exactly one flag.
+    export LORA_RANKS="8 16 32 64"
+    export STAGE1_LORA_RANK=64
+    ;;
+  v12-parcel-kd7b)
+    # v11 + a frozen external LLaVA-1.5-7B KD teacher. HIPSTER-PIPELINE run.
+    #
+    # Why it exists: `teacher=self` distills the model at tok_levels[0] into its
+    # own smaller levels, and measures a KL of ~0.006 -- teacher and student are
+    # literally the same weights on informationally equivalent inputs, so there
+    # is nothing to distill. `teacher=llava` loads a frozen 7B instead, which
+    # makes EVERY level a student (tok_levels[0] included) and gives the KL real
+    # signal. That question was raised by v7-kd7b, which was cancelled mid-run by
+    # the 2026-09-08 outage (section 15d); v12 supersedes it by asking the same
+    # question on top of v11 instead of the superseded v4-era setup.
+    #
+    # Two hard constraints, both checked or noted below:
+    #   1. VOCAB. attach_kd_teacher (llava/model/elastic/engine.py) raises if
+    #      teacher and student vocab_size differ, so this only works on
+    #      Llama-32000 backbones -- tinyllama and mobilellama. Every other
+    #      backbone in the hipster matrix (smollm2, qwen*, phi2) is excluded,
+    #      and the guard below fails fast rather than after hours of Stage 1.
+    #   2. VRAM. The frozen 7B costs ~14 GB/GPU on top of the student and is a
+    #      plain attribute on ElasticEngine, not a submodule, so ZeRO does NOT
+    #      shard it. A40-class or better; it does not fit a 23 GB A10 alongside
+    #      training. Hence the raised DEFAULT_GRES -- override GRES on hipster.
+    case "$SLM_KEY" in
+      tinyllama|mobilellama) ;;
+      *)
+        echo "ERROR: v12-parcel-kd7b needs a Llama-32000-vocab backbone for the" >&2
+        echo "       frozen LLaVA-1.5-7B teacher; SLM_KEY='$SLM_KEY' is not one." >&2
+        echo "       Valid: tinyllama, mobilellama. attach_kd_teacher would raise" >&2
+        echo "       on the vocab_size mismatch after Stage 1 had already run." >&2
+        exit 1 ;;
+    esac
+    export ELASTIC_RUN_TAG=v12-parcel-kd7b
+    export USE_TOKEN_DECORRELATION=False
+    export VISION_LORA_ENABLE=False
+    export LORA_RANKS="8 16 32 64"
+    export STAGE1_LORA_RANK=64
+    export TEACHER=llava
+    export TEACHER_MODEL_PATH=liuhaotian/llava-v1.5-7b
+    export PREFIX_KL_WEIGHT=0.1
+    DEFAULT_GRES="gpu:A40:2"
+    echo "  NOTE: hipster-pipeline recipe. Frozen 7B teacher needs ~14 GB/GPU on"
+    echo "        top of the student and is not ZeRO-sharded; verify headroom on"
+    echo "        the target GPU and override GRES for that cluster's card names."
+    ;;
+  v13-parcel-longladder)
+    # v11's flags (PARCEL, decorrelation off, vision LoRA off) on v6-tokrange's
+    # 8-level 576-16 ladder instead of v8/v9/v10/v11's 4-level grid.
+    #
+    # Why: v6 (resampler_arch=query) showed the extended ladder is flat and, on
+    # the 256-16 sub-range it shares with the short grid, LESS elastic than v4's
+    # own short-grid result (docs/EXPERIMENT_JOURNAL.md section 16b). v8-parcel
+    # is the one thing that has produced real elasticity on the short grid
+    # (section 16c). This run asks whether PARCEL fixes the long-ladder failure
+    # or whether the failure is orthogonal to the resampler architecture.
+    #
+    # NOT free: kl_teacher_tok_level defaults to index 0, and by convention
+    # index 0 is the LARGEST tok_levels entry -- the teacher forward pass at
+    # that level runs on EVERY step, unlike the single randomly sampled student
+    # (n_sample_students=1) whose cost is normally ladder-length-independent.
+    # Here index 0 is 576, not 256, so every step's teacher pass is ~2x the
+    # v8/v9/v10/v11 cost (matches v6's own measured 1.315 vs 0.639 TFLOPs), and
+    # the average sampled-student cost rises too (student pool is {512 448 384
+    # 256 144 64 16}, mean ~261 tok, vs {144 64 16}, mean ~75 tok, on the short
+    # grid). Stage 1 also runs at 576 tok instead of 256. Real added wall-clock
+    # on top of the ~85h short-grid runtime -- not measured precisely, only
+    # bounded by the ~2x FLOPs ratio; if this run needs to be time-boxed,
+    # measure a few steps first rather than assuming a multiplier.
+    #
+    # LORA_RANKS mirrors v6's own convention exactly (ranks ascend as budget
+    # descends, max stays 64) SPECIFICALLY so the four levels this ladder
+    # shares with v8/v9/v10/v11 (256/144/64/16) carry the identical ranks
+    # those runs use -- keeping that 4-point comparison uncontaminated by a
+    # rank confound, on top of the resampler-architecture question this run
+    # actually asks.
+    export ELASTIC_RUN_TAG=v13-parcel-longladder
+    export TOK_LEVELS="576 512 448 384 256 144 64 16"
+    export LORA_RANKS="2 4 6 8 8 16 32 64"
+    export STAGE1_TOK_LEVEL=576
+    export STAGE1_LORA_RANK=64
+    export USE_TOKEN_DECORRELATION=False
+    export VISION_LORA_ENABLE=False
+    # RESOLVED 2026-09-13 (section 16l, decision 33 closed): decorrelation
+    # stays OFF. The clean isolation v9 (decorr on) vs hipster v11 (decorr off),
+    # PARCEL + no vision LoRA in both, is negative at 256 tok -- POPE -3.12,
+    # TextVQA -2.60, GQA -2.07 -- and it flattens the ladder (TextVQA spread
+    # 0.44 vs 10.09). Nothing to flip; leave this run as submitted.
+    ;;
+  final-parcel)
+    # THE FINAL PAPER RECIPE (docs/EXPERIMENT_JOURNAL.md section 16l + the
+    # "Final best config" block at the end of section 16). This is v8-parcel,
+    # verbatim, made backbone-parametrisable: run it with SLM_KEY=<backbone>
+    # for every SLM in the paper, INCLUDING tinyllama again -- that re-run is
+    # the seed/cluster replicate of v8 the paper does not yet have.
+    #
+    # Every choice below is the winner of a single-flag isolation on TinyLlama:
+    #   PARCEL vs query        v11 vs v4   -> PARCEL creates the budget gradient
+    #   nested LoRA vs none    v8  vs v11  -> +6.3 TextVQA / +2.1 GQA @256, lifts
+    #                                        the whole curve; costs ~2 SciQA
+    #   shared r16 vs none     v10 vs v11  -> shared adapter is WORSE than none
+    #                                        at 256 tok: per-level nesting is
+    #                                        the point, not adapter capacity
+    #   decorr on vs off       v9  vs v11  -> negative (see v13 note above)
+    #   7B KD vs self          v12 vs v11  -> negative everywhere, TextVQA -6.4
+    #   CORAL                  never tested on; not introduced into the final
+    #                          sweep on purpose
+    #   anchor fixed vs ratio  identical at ratio 0.25 on this grid (v8's
+    #                          64/36/16/4 table IS 0.25); ratio kept because it
+    #                          generalises if the grid ever changes
+    #
+    # NOTE the launcher default VISION_LORA_ENABLE is False (flipped 2026-09-09
+    # on the v4-vs-v5 result, which was measured on the plain query resampler).
+    # Under PARCEL the sign reverses, so this recipe sets it True explicitly.
+    # Do not rely on the launcher default for any final-sweep run.
+    export ELASTIC_RUN_TAG=final-parcel
+    export TOK_LEVELS="256 144 64 16"
+    export LORA_RANKS="8 16 32 64"
+    export STAGE1_TOK_LEVEL=256
+    export STAGE1_LORA_RANK=64
+    export VISION_LORA_ENABLE=True
+    export VISION_LORA_SPECIALIZE_TOK=True
+    export USE_TOKEN_DECORRELATION=False
+    export TEACHER=self
+    ;;
+  v14-parcel-asclora)
+    # v8 with the LoRA-rank ladder REVERSED so rank follows budget:
+    #   v8 :  256->r8   144->r16  64->r32  16->r64   (largest budget, smallest rank)
+    #   v14:  256->r64  144->r32  64->r16  16->r8    (rank grows with budget)
+    # Everything else identical to v8 / final-parcel.
+    #
+    # Why: the vision-LoRA arm comparison (EXPERIMENT_JOURNAL 16m: none -> shared
+    # r16 -> nested) shows per-level nesting is what makes the adapter help at
+    # every budget. v8's pairing was a convention ("small budgets need more
+    # adaptation to compensate"), never ablated. The competing hypothesis is
+    # that the 256-token level -- the teacher, and the level carrying the most
+    # information -- should get the most adapter capacity, with the 16-token
+    # level's rank-8 barely perturbing CLIP. v14 tests that directly.
+    #
+    # Second thing this flips, inherent to the reversal, not a separate flag:
+    # Stage 1 trains a rank-64 adapter at 256 tok. In v8, Stage 2's 256 level
+    # then uses only the first 8 columns of that warm start; in v14 it uses all
+    # 64, so the teacher level's warm start is finally consistent end to end.
+    #
+    # Requires the 2026-09-13 NestedLoRALinear change (max_rank = max(ranks),
+    # no ascending assert) -- validated by jobs/test_lora_rank_order.sh.
+    export ELASTIC_RUN_TAG=v14-parcel-asclora
+    export TOK_LEVELS="256 144 64 16"
+    export LORA_RANKS="64 32 16 8"
+    export STAGE1_TOK_LEVEL=256
+    export STAGE1_LORA_RANK=64
+    export VISION_LORA_ENABLE=True
+    export VISION_LORA_SPECIALIZE_TOK=True
+    export USE_TOKEN_DECORRELATION=False
+    export TEACHER=self
+    ;;
+  final-parcel-so400m)
+    # final-parcel (v8's best config) with SigLIP so400m-patch14-384 instead of
+    # CLIP-L/14-336. NOT a drop-in VISION_TOWER swap: so400m's 384/14=27.43 grid
+    # rounds to 27x27=729 patches, whose only integer-pooling anchor counts are
+    # {1,9,81,729} (729=3^6) vs CLIP's 576-patch {1,4,9,16,36,64,144,576}. Under
+    # final-parcel's own anchor_mode=ratio, that gap makes the intended 25% split
+    # badly miss at 256 tokens (ratio's round-then-snap-DOWN-only search rounds
+    # 256*0.25=64, finds nothing reachable at or below 64 except 9, and can never
+    # reach 81 -- which sits ABOVE the naive target but is the closest reachable
+    # value overall). Verified in code (job 27464, not just by hand):
+    #   budget   ratio-mode picks      best reachable (this recipe)
+    #   256      9   (3.5%)            81  (31.6%)   <- the one real difference
+    #   144      9   (6.2%)            9   (6.2%)    <- ratio already optimal
+    #   64       9   (14.1%)           9   (14.1%)   <- ratio already optimal
+    #   16       1   (6.2%)            1   (6.2%)    <- ratio already optimal
+    # So anchor_mode=fixed only changes the 256-token level; the other three were
+    # already at their best reachable value under ratio mode despite the raw
+    # percentages looking off. Table derived two ways (closest to the 25% target;
+    # largest reachable count that stays a minority of the budget) -- they agree
+    # exactly, and n_anchors_for() reproduces the table exactly at all 4 budgets.
+    #
+    # SmolLM2 (1.7B, largest LLM here) + so400m (428M, 1.41x CLIP-L's params) OOM'd
+    # in Stage 2 on a single 24GB A10 during backward (job 27461, 22.28/22.30GB
+    # used) -- confirmed a capacity ceiling, not a bug: passed cleanly on a single
+    # UNSHARDED A40 (job 27463, a harder memory test than the real 2-GPU config).
+    # This recipe therefore needs A40, not A10/untyped gpu:2 -- see GRES below.
+    export ELASTIC_RUN_TAG=final-parcel-so400m
+    export TOK_LEVELS="256 144 64 16"
+    export LORA_RANKS="8 16 32 64"
+    export STAGE1_TOK_LEVEL=256
+    export STAGE1_LORA_RANK=64
+    export VISION_LORA_ENABLE=True
+    export VISION_LORA_SPECIALIZE_TOK=True
+    export USE_TOKEN_DECORRELATION=False
+    export TEACHER=self
+    export VISION_TOWER=google/siglip-so400m-patch14-384
+    export ANCHOR_MODE=fixed
+    export ANCHOR_ROUTING="256:81,144:9,64:9,16:1"
+    DEFAULT_GRES="gpu:A40:2"
+    ;;
+  final-parcel-576ctrl)
+    # Single-level control: final-parcel's EXACT architecture (PARCEL,
+    # anchor_mode=ratio@0.25, nested vision LoRA on/specialized, decorr off,
+    # self-teacher, CLIP-L/14-336) run at ONLY 576 tokens -- no elasticity
+    # ladder. tok_levels/lora_ranks are single-element lists, so
+    # engine.grid() = [0], students_all = [] (the sole level IS the teacher
+    # level -- verified in llava_elastic_mixin.py's forward()), meaning
+    # exactly ONE forward per step, not two: this is NOT v13-parcel-longladder
+    # (8-level 576->16 ladder, vision LoRA OFF, §16j-16p) run at one point: it
+    # answers a different, narrower question -- "does final-parcel's
+    # architecture reach native-resolution parity" -- with no ladder overhead
+    # and no LoRA-off confound.
+    #
+    # Anchor split at budget=576, anchor_ratio=0.25: target=144, which IS a
+    # valid reachable anchor count on CLIP-L's 24x24 grid (divisors of 24 give
+    # {1,4,9,16,36,64,144,576}) -- n_anchors_for(576,576)=144 anchors + 432
+    # queries exactly, no ratio-mode snap-down loss (unlike so400m's grid).
+    # num_queries = tok_levels[0] = 576, so 432 <= 576 is satisfied trivially.
+    #
+    # No existing checkpoint can warm-start this: the only prior
+    # STAGE1_TOK_LEVEL=576 checkpoint (v13-parcel-longladder's Stage 1,
+    # elastic-pretrain-tinyllama-v13-parcel-longladder) has use_lora=False in
+    # its own elastic_config.json -- no vision LoRA weights exist to
+    # warm-start Stage 2's rank-64 adapter from. Needs a fresh Stage 1
+    # pretrain (this recipe includes one; run it, don't try to reuse v13's).
+    #
+    # GRES pinned to A10:2 (node208 is the only node with that exact
+    # type+count -- node205 is A40:2) per request to run this on node208
+    # specifically. Smoke-tested first (jobs/smoke_final_parcel_576ctrl.sh)
+    # to check for OOM at 576 tokens on A10's 24GB before the real multi-day
+    # run -- see docs/EXPERIMENT_JOURNAL.md for the result.
+    export ELASTIC_RUN_TAG=final-parcel-576ctrl
+    export TOK_LEVELS="576"
+    export LORA_RANKS="64"
+    export STAGE1_TOK_LEVEL=576
+    export STAGE1_LORA_RANK=64
+    export VISION_LORA_ENABLE=True
+    export VISION_LORA_SPECIALIZE_TOK=True
+    export USE_TOKEN_DECORRELATION=False
+    export TEACHER=self
+    DEFAULT_GRES="gpu:A10:2"
+    ;;
+  v4-query)
+    # LM-scale rank study (paper, Sec. III-B): a PURELY LEARNED nested query
+    # resampler with learned positional embeddings and no anchors, no vision
+    # LoRA, self-KD -- the v4 recipe -- to be run at several LM scales with
+    # everything else fixed (SLM_KEY=qwen0.5b|qwen1.5b|qwen3b: one family, one
+    # tokenizer, one pretraining corpus, so LM size is the only thing that moves).
+    # Then measure the projected-token rank at n=256 with debug/measure_token_rank.py.
+    # The v4/v5 checkpoints behind the paper's 50.8% row no longer exist, so this
+    # is a fresh set of runs, not a re-measurement.
+    # A40:2: Qwen's 151936-token vocab makes prefix_kl_loss's (B,L,V) tensor OOM on
+    # a 24 GB A10 (memory: project-large-vocab-kd-oom).
+    export ELASTIC_RUN_TAG=v4-query
+    export RESAMPLER_ARCH=query
+    export USE_POS_EMBED=True
+    export VISION_LORA_ENABLE=False
+    export LORA_RANKS="8 16 32 64"     # inert while vision LoRA is off
+    export STAGE1_LORA_RANK=64
+    export USE_TOKEN_DECORRELATION=False
+    export TEACHER=self
+    DEFAULT_GRES="gpu:A40:2"
+    ;;
+  v4-query-256)
+    # Rank estimate at a SINGLE budget: the v4-query recipe (purely learned query bank,
+    # learned positional embeddings, no anchors, no vision LoRA) trained at n=256 only, for
+    # MobileLLaMA and SmolLM2 (SLM_KEY=mobilellama|smollm2). One level means one forward per
+    # step and no prefix-nesting training; the queries are only ever exercised at 256, which
+    # is the budget the rank is measured at. Rank of the projected tokens is then measured
+    # with debug/measure_token_rank.py (queued by queue_followup_pipeline.sh).
+    # len(lora_ranks) must equal len(tok_levels) even though vision LoRA is off.
+    export ELASTIC_RUN_TAG=v4-query-256
+    export TOK_LEVELS="256"
+    export LORA_RANKS="64"
+    export STAGE1_TOK_LEVEL=256
+    export STAGE1_LORA_RANK=64
+    export RESAMPLER_ARCH=query
+    export USE_POS_EMBED=True
+    export VISION_LORA_ENABLE=False
+    export USE_TOKEN_DECORRELATION=False
+    export TEACHER=self
+    ;;
+  v4-query-nopos)
+    # Same as v4-query but WITHOUT positional embeddings: the condition the paper
+    # currently only cites (4.7% rank, checkpoint deleted). TinyLlama by default.
+    export ELASTIC_RUN_TAG=v4-query-nopos
+    export RESAMPLER_ARCH=query
+    export USE_POS_EMBED=False
+    export VISION_LORA_ENABLE=False
+    export LORA_RANKS="8 16 32 64"
+    export STAGE1_LORA_RANK=64
+    export USE_TOKEN_DECORRELATION=False
+    export TEACHER=self
+    ;;
+  v4-query-sincos)
+    # Same as v4-query but with MQT-LLaVA's FROZEN 2-D sine-cosine positional grid
+    # (pos_embed_type=sincos2d) instead of learned embeddings. Job 26568 recorded a
+    # 7B model WITHOUT positional embeddings collapsing to ~21/256 (TinyLlama ~12/256),
+    # and MQT-7B (which uses sincos2d) reaches 217/256, so the paper's 50.8% (learned,
+    # TinyLlama) vs 84.9% (MQT-7B) gap may reflect positional-embedding design rather
+    # than LM scale. This isolates that: LM held at TinyLlama, only the positions change.
+    export ELASTIC_RUN_TAG=v4-query-sincos
+    export RESAMPLER_ARCH=query
+    export USE_POS_EMBED=True
+    export POS_EMBED_TYPE=sincos2d
+    export VISION_LORA_ENABLE=False
+    export LORA_RANKS="8 16 32 64"
+    export STAGE1_LORA_RANK=64
+    export USE_TOKEN_DECORRELATION=False
+    export TEACHER=self
+    ;;
+  parcel-faithful)
+    # PARCEL as published (arXiv 2605.30126): budget-aware routing that gives
+    # 16 anchors at n=16 and 64 anchors at n>=64 (so n=16 and n=64 are pure
+    # anchors), queries conditioned on the anchors, nested-dropout queries,
+    # FROZEN vision encoder (no LoRA), language-modeling loss only (no
+    # distillation). CLIP-L/14-336, TinyLlama, the 4-budget ladder and the paper's
+    # data recipe are kept so the row is comparable to Table III.
+    # SINGLE_BUDGET_PER_STEP=True: each step trains ONE budget drawn uniformly from the
+    # ladder, with no always-present n=256 reference level, as in PARCEL's nested-dropout
+    # training ("we sample a budget B ... keep the first B-Np queries").
+    # Known departure from PARCEL, to be stated with the result: the LM is fine-tuned in
+    # Stage 2 (our recipe); PARCEL's LM training setup is not given in its main text.
+    export ELASTIC_RUN_TAG=parcel-faithful
+    export RESAMPLER_ARCH=pool_anchored
+    export ANCHOR_MODE=fixed
+    export ANCHOR_ROUTING="256:64,144:64,64:64,16:16"
+    export USE_KD=False
+    export SINGLE_BUDGET_PER_STEP=True
+    export VISION_LORA_ENABLE=False
+    export LORA_RANKS="8 16 32 64"     # inert while vision LoRA is off
+    export STAGE1_LORA_RANK=64
+    export USE_TOKEN_DECORRELATION=False
+    export TEACHER=self
+    ;;
+  *)
+    echo "Usage: bash submit_elastic_run.sh {v9-parcel-decorr|v10-parcel-lora16|v11-parcel-nolora|v12-parcel-kd7b|v13-parcel-longladder|v14-parcel-asclora|final-parcel|final-parcel-so400m|final-parcel-576ctrl|v4-query|v4-query-256|v4-query-nopos|v4-query-sincos|parcel-faithful}" >&2
+    exit 1
+    ;;
+esac
+
+# SEED=<n> makes any recipe a seed replicate: the seed is passed to both stages
+# (HF --seed; unset means the HF default, 42) and the run tag gets a -seed<n>
+# suffix so it never overwrites the seed-42 checkpoint.
+if [ -n "${SEED:-}" ]; then
+    export SEED
+    export ELASTIC_RUN_TAG="${ELASTIC_RUN_TAG}-seed${SEED}"
+fi
+
+# TAG_SUFFIX=-smoke keeps a test run's checkpoints out of the real run's directories.
+if [ -n "${TAG_SUFFIX:-}" ]; then
+    export ELASTIC_RUN_TAG="${ELASTIC_RUN_TAG}${TAG_SUFFIX}"
+fi
+
+GRES="${GRES:-$DEFAULT_GRES}"
+CKPT="/var/scratch/skalra/flexllava/checkpoints/elastic-finetune-${SLM_KEY}-${ELASTIC_RUN_TAG}"
+# --array must match the ladder length or eval_lmms_level.sh fails loudly on the
+# out-of-range index (it no longer silently falls back to a 4-level default).
+N_LEVELS=$(wc -w <<< "$TOK_LEVELS")
+ARRAY="0-$(( N_LEVELS - 1 ))"
+
+echo "── ${ELASTIC_RUN_TAG} (${SLM_KEY}) ──────────────────────────────"
+for v in TOK_LEVELS LORA_RANKS STAGE1_TOK_LEVEL STAGE1_LORA_RANK RESAMPLER_ARCH \
+         ANCHOR_MODE ANCHOR_RATIO ANCHOR_ROUTING USE_TOKEN_DECORRELATION DECORR_WEIGHT \
+         VISION_LORA_ENABLE VISION_LORA_SPECIALIZE_TOK TEACHER TEACHER_MODEL_PATH \
+         PREFIX_KL_WEIGHT VISION_TOWER USE_KD SINGLE_BUDGET_PER_STEP USE_POS_EMBED POS_EMBED_TYPE SEED; do
+    printf '  %-26s %s\n' "$v" "${!v:-<launcher default>}"
+done
+printf '  %-26s %s\n' "gres" "$GRES"
+printf '  %-26s %s\n' "eval --array" "$ARRAY"
+
+if [ -n "${DRY_RUN:-}" ]; then echo "DRY_RUN set; nothing submitted."; exit 0; fi
+
+# RUN_INLINE=1: run Stage 1 then Stage 2 in THIS shell with the recipe's exact
+# environment (for smoke tests inside an sbatch job; combine with MAX_STEPS,
+# NUM_GPUS and TAG_SUFFIX). Nothing is submitted or logged.
+if [ -n "${RUN_INLINE:-}" ]; then
+    bash scripts/v1_5/pretrain_elastic_slm.sh "$SLM_KEY" && bash scripts/v1_5/finetune_elastic_slm.sh "$SLM_KEY"
+    exit $?
+fi
+
+# DEPENDENCY="afterok:123:456" holds the training job until those jobs finish
+# (used to queue follow-up experiments behind running ones).
+TRAIN_ID=$(sbatch --parsable ${DEPENDENCY:+--dependency=$DEPENDENCY} --gres="$GRES" run_job_slm.sh "$SLM_KEY")
+echo "  train job   : $TRAIN_ID  (Stage 1 + Stage 2)"
+EVAL_ID=$(sbatch --parsable --dependency=afterok:"$TRAIN_ID" --array="$ARRAY" \
+                 eval_lmms_level.sh "$CKPT")
+echo "  eval job    : $EVAL_ID  (afterok:$TRAIN_ID)"
+echo "  checkpoint  : $CKPT"
+
+# Job-id -> recipe map. `scontrol show job` records only "run_job_slm.sh
+# <key>", which is identical for every recipe here, so without this line there
+# is nothing on disk that says which job was which -- the same gap that made
+# v9's configuration unrecoverable. Append-only; job ids are never reused.
+# docs/, not jobs/: jobs/ is gitignored (it holds the .out logs), and the whole
+# point of this file is that it survives in the repo alongside the recipes.
+LOG=docs/SUBMITTED_RUNS.tsv
+[ -s "$LOG" ] || printf 'submitted_utc\trecipe\tslm_key\ttrain_job\teval_job\ttok_levels\tlora_ranks\tresampler\tdecorr\tvision_lora\tspecialize_tok\tcheckpoint\n' > "$LOG"
+printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$ELASTIC_RUN_TAG" "$SLM_KEY" "$TRAIN_ID" "$EVAL_ID" \
+    "$TOK_LEVELS" "$LORA_RANKS" "$RESAMPLER_ARCH" "$USE_TOKEN_DECORRELATION" \
+    "$VISION_LORA_ENABLE" "${VISION_LORA_SPECIALIZE_TOK:-True}" "$CKPT" >> "$LOG"
+echo "  recorded in : $LOG"

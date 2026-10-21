@@ -1,0 +1,155 @@
+#!/bin/bash
+#SBATCH --job-name=eval_baseline
+#SBATCH -t 48:00:00
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=1
+#SBATCH --gres=gpu:1
+#SBATCH --cpus-per-task=8
+#SBATCH --output=./jobs/eval_baseline_%A.out
+
+# Baseline: stock LLaVA-1.5-7B at its native (maximum) visual-token budget.
+#
+# Why this needs its own script instead of eval_lmms_level.sh
+# ----------------------------------------------------------
+# The original model is NOT elastic. eval_lmms_level.sh uses
+# --model llava_elastic, whose _attach_elastic() hard-requires
+# elastic_config.json and raises FileNotFoundError without it. So this uses
+# lmms-eval's plain `llava` wrapper.
+#
+# What "max level" means here
+# ---------------------------
+# Stock LLaVA-1.5 has no token levels: CLIP-L/336 yields a 24x24 patch grid,
+# so it always feeds the LLM all 576 visual tokens. Our fork's llava wrapper
+# passes matryoshka_vis_token_scale from the model config, and stock
+# llava-v1.5-7b's config.json has no such key -> None -> the matryoshka
+# pooling path is skipped entirely and the full 576 tokens are used. That IS
+# the maximum level, and it is the model's native behaviour.
+#
+# Note this is a HIGHER token budget than our elastic max (tok_levels[0]=256),
+# so it is an upper-bound reference rather than a token-matched comparison.
+#
+# Submit: sbatch eval_lmms_baseline_llava.sh
+
+MODEL_PATH="${1:-liuhaotian/llava-v1.5-7b}"     # resolved from the HF cache
+# Tag defaults to the stock-7B name for a bare invocation, but any other
+# checkpoint gets its own directory -- otherwise the TinyLLaVA control's scores
+# would land on top of the 7B baseline's and summarize_eval.py would mix them.
+if [ "$MODEL_PATH" = "liuhaotian/llava-v1.5-7b" ]; then
+    MODEL_TAG="${2:-llava-v1.5-7b-baseline}"
+else
+    MODEL_TAG="${2:-$(basename "$MODEL_PATH")}"
+fi
+LABEL="576tok-native"
+
+# Same auto-detection as eval_lmms_level.sh: the plain wrapper defaults to
+# vicuna_v1, which is right for LLaVA-1.5 and for the TinyLlama control, but
+# silently wrong for a chatml or phi backbone.
+BASE_LLM=$(python3 -c "
+import json
+try:
+    print(json.load(open('${MODEL_PATH}/config.json')).get('_name_or_path', '').lower())
+except Exception:
+    print('')
+")
+case "$BASE_LLM" in
+    *phi-3*|*phi3*)                       CONV_TEMPLATE="phi3" ;;
+    *tinyllama*|*mobilellama*)            CONV_TEMPLATE="vicuna_v1" ;;
+    *qwen*|*stablelm*|*smollm*)           CONV_TEMPLATE="chatml" ;;
+    *phi*)                                CONV_TEMPLATE="phi" ;;
+    *)                                    CONV_TEMPLATE="vicuna_v1" ;;
+esac
+LOG_ROOT=/var/scratch/skalra/flexllava/eval_logs
+OUTDIR="${LOG_ROOT}/${MODEL_TAG}/${LABEL}"
+
+# Same five tasks as the elastic evals so the numbers line up column-for-column.
+# mmbench_en_dev still excluded (needs OPENAI_API_KEY; without it unparseable
+# answers get a random option -- see eval_lmms_level.sh for the full rationale).
+TASKS="${TASKS:-mme,pope,scienceqa_img,textvqa_val,gqa}"
+
+module load cuda12.6/toolkit/12.6
+eval "$(conda shell.bash hook)"
+conda activate matryoshka-mm
+
+export HF_HOME=/var/scratch/skalra/.cache/huggingface
+export HF_DATASETS_CACHE=/var/scratch/skalra/.cache/huggingface/datasets
+
+cd /home/skalra/FlexLLaVA
+
+echo "Job started: $(date)"
+echo "Node: $(hostname)"
+nvidia-smi | head -12
+
+# Same as eval_lmms_level.sh: --gres=gpu:1 takes whichever GPU type SLURM
+# gives us, so pick the batch size at runtime instead of hardcoding one GPU's
+# VRAM budget. 7B in fp16 is ~14GB of weights -- these defaults are
+# conservative for that; a smaller checkpoint (e.g. the 1.1B M3 baseline) can
+# raise it via BATCH_SIZE=... without editing the script. Batch size affects
+# speed only, never the scores.
+GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader | head -1)
+if echo "$GPU_NAME" | grep -q "A40"; then
+    BATCH_SIZE="${BATCH_SIZE:-4}"
+elif echo "$GPU_NAME" | grep -q "A10"; then
+    BATCH_SIZE="${BATCH_SIZE:-2}"
+else
+    BATCH_SIZE="${BATCH_SIZE:-1}"
+fi
+echo "GPU: $GPU_NAME  →  batch_size=${BATCH_SIZE}"
+
+echo "Model:  $MODEL_PATH   (non-elastic, native 576 visual tokens)"
+echo "Tag:    $MODEL_TAG   conv_template=$CONV_TEMPLATE"
+echo "Tasks:  $TASKS"
+echo "Batch:  $BATCH_SIZE"
+
+pip show lmms-eval >/dev/null 2>&1 || pip install -e lmms-eval -q
+mkdir -p "$OUTDIR"
+
+echo ""
+echo "══════════════════════════════════════════════════"
+echo "  BASELINE  ${MODEL_TAG}  (native 576-token budget, no compression)"
+echo "══════════════════════════════════════════════════"
+
+accelerate launch --num_processes=1 \
+    -m lmms_eval \
+    --model       llava \
+    --model_args  "pretrained=${MODEL_PATH},conv_template=${CONV_TEMPLATE}" \
+    --tasks       "$TASKS" \
+    --batch_size  $BATCH_SIZE \
+    --log_samples \
+    --log_samples_suffix "baseline_${LABEL}" \
+    --output_path "$OUTDIR"
+
+echo ""
+echo "Done baseline: $(date)"
+
+# ── Analytic efficiency for the baseline ────────────────────────────────────
+# The plain `llava` wrapper has no efficiency instrumentation (that lives in
+# LlavaElastic), but the cost model is deterministic given the config and the
+# sequence length, so it can be computed here for free -- no GPU needed. This
+# gives the baseline a FLOPs/latency/memory row comparable to the elastic runs.
+echo ""
+echo "=== analytic efficiency (${MODEL_TAG}, 576 visual tokens) ==="
+MODEL_PATH="$MODEL_PATH" python3 - << 'PYEOF'
+from transformers import AutoConfig
+import llava.model  # registers the llava_* configs
+from llava.eval.efficiency import ElasticAnalyzer, vision_tower_gflops
+
+import os
+# Must follow the checkpoint being evaluated: hardcoding the 7B here printed
+# 7B FLOPs/memory for whatever model was actually scored.
+cfg = AutoConfig.from_pretrained(os.environ["MODEL_PATH"])
+TEXT_LEN, GEN, NTOK = 64, 32, 576
+for hw in ["jetson_orin_nano_8gb", "nvidia_A10"]:
+    an = ElasticAnalyzer(cfg, hw)
+    r = an.analyze_generate_task(TEXT_LEN + NTOK, GEN)
+    fits = an.fits_in_memory(r["memory_consumption"])
+    print(f"  {hw:24} prefill {r['prefill_flops']/1e12:8.3f} TFLOPs | "
+          f"{r['prefill_time']*1e3:8.2f} ms | peak {r['memory_consumption']/1e9:6.2f} GB | "
+          f"fits={fits}")
+print(f"  vision tower constant: {vision_tower_gflops():.0f} GFLOPs/image")
+print("  NOTE: 576 tokens vs our elastic max of 256 -- upper-bound reference,")
+print("        not a token-matched comparison.")
+PYEOF
+
+echo ""
+echo "Results: $OUTDIR"
+echo "Job complete: $(date)"
