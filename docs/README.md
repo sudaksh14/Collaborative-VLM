@@ -23,6 +23,7 @@ Planning documents added 2026-10-21. They are separate from the existing FlexLLa
 | [analysis.md](analysis.md) | What was inspected; Nest-VLM and CoInfer analysed (problem, design, setup, results); official-code status; problems found in the Nest-VLM paper; transfer/compatibility analysis; repo gaps |
 | [experimental-plan.md](experimental-plan.md) | Hypotheses H1–H9, workloads, datasets, models, hardware, baselines, metrics, phases, ablations, statistics, risks/fallbacks, timeline |
 | [implementation-plan.md](implementation-plan.md) | Target architecture, work packages (harness, ROI model, crop-aware nested VLM, controller, evaluation, packaging), milestones, reproducibility checklist, deployment notes |
+| [brainstorm.md](brainstorm.md) | (2026-10-22) Adaptive-HR papers (ViCrop, SGL, Q-Zoom, AdaptVision, S2, Monkey, ViCO, HyperVL, VISOR) mapped onto a dual-elastic (pixel × token) Nest-VLM pipeline; ideas ranked by effort; scope for the 2026-11-05 round vs later |
 | [paper-plan.md](paper-plan.md) | SenSys 2027 CFP summary, novelty claims checked against literature, recommended contribution, outline, related-work and anonymity strategy |
 
 ## Things you should know before relying on this
