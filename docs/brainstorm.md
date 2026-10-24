@@ -65,6 +65,21 @@ Our stack: CLIP-L/14-336 (frozen, with nested LoRA), then the NTR resampler (poo
  optional external ROI: MCU / CPU MGround (CoInfer) or MobileNet VRC (HyperVL) replaces or primes the self-ROI
 ```
 
+**Status of this pipeline after I-2, I-3, I-4 and the Jetson-log analysis (revised 2026-10-24).** The diagram above stays as the *proposal*; the evidence so far says this about each branch:
+
+| Branch of the pipeline | Evidence | Verdict |
+|---|---|---|
+| First stage at n₁ = 16 | §8: LM prefill is flat from 67 to 115 tokens (74.2 vs 75.1 ms), the tower costs 184 ms at every budget. Full image at 64 tokens scores 22.6 vs 18.6 at 16 on the pilot questions. | **Change n₁ to 64.** n₁ = 16 buys no latency on the Orin and costs 4 accuracy points. |
+| Escalate tokens (same view, n₁ → n₂, no second tower pass) | Not run as a cascade. | **Untested.** Cheapest escalation by the cost model; only meaningful once n₁ > 64 or when decode time matters. |
+| Gate = SGL-style confidence | §10.4: mean-token probability separates correct from wrong answers (AUROC 0.89), first-token probability does not clear 0.7, and neither predicts that a crop will help (AUROC 0.38–0.46). No consistency-under-pruning term implemented. | **Partly supported.** Usable as an "answer is probably fine" exit, not as a "zoom now" trigger. |
+| Escalate pixels with a *self-guided* ROI from the n₁ pass | §10: +2.4 over the full image at 64 tokens, +3.2 over a centre window, small boxes ≈ centre crop; the best cascade (24.3–24.7 at 400–427 ms) is dominated by full-image 256 tokens (27.3 at 381 ms). | **Not supported on this model.** The second tower pass is the cost; the guide is too coarse. |
+| Escalate pixels with a *free* ROI (oracle or external: MCU / CPU MGround, MobileNet VRC) | §7: oracle crop at 64 tokens = 39.9–40.3 vs 22.6 for the full image, 15 points above the self-guided crop. | **Supported as the upper bound.** This is the arm that keeps the pipeline alive; I-9/I-10 matter more than I-3. |
+| KV reuse of the global prefix for the ROI pass (Q-Zoom) | Not implemented. The latency model charges a full second pass; with the tower at 184 ms of ≈ 270, reuse saves only the LM share. | **Low priority.** Revisit if the LM share grows. |
+| Pixel axis P: thumbnail only / thumbnail + ROI / ROI only | §7, §10: both ROI modes run; thumbnail + ROI is +1.4 (64 tokens) over ROI only for self-ROI, +2.8 for the oracle. | **Both kept.** |
+| Evidence base | TextVQA val images (not true 1080p frames), one model, accuracy from the lmms scorer, latency modelled from the Nest-VLM logs. V\* and the Orin harness (I-0) are still missing. | **Provisional.** |
+
+[INTERP] Net: the self-guided two-pass form of the pipeline loses to simply running the full image at 256 tokens on this model; the pipeline is worth building only around a box that arrives without a second tower pass, or with a much cheaper guide.
+
 The two elastic axes, stated per query:
 - **Pixel axis P** ∈ {thumbnail only; thumbnail + 1 ROI view (crop of the *full-resolution* frame, at native 336²); crop only (CoInfer-style, one pass)}. Cost unit: number of 336² CLIP passes, encoded serially (HyperVL) so peak memory stays flat.
 - **Token axis T**: (n₁ for the global view, n₂ for the ROI view) ∈ the nested ladder {16, 64, 144, 256}, allocated per view (ViCO).
@@ -349,3 +364,15 @@ Random gate at 40 %: 21.5; oracle gate (escalate only the wrong guide answers): 
    [FACT] Against I-4's refutation test (AUROC < 0.7 for correctness at n = 16): the first-token score fails it (0.687, upper CI 0.705 only just reaches it), the mean-token score passes clearly (0.888). [INTERP] The mean-token score may partly measure answer length (long, hard-to-read strings get a low mean), so it is not evidence of calibrated uncertainty. [FACT] Neither score predicts *when the crop helps*: AUROC for "crop beats the guide answer" is below 0.5 for both (positives are only 10 % of questions), so the gate separates "answer is probably right" from "probably wrong" but not "wrong and fixable by zooming". That explains why the cascade in §10.3 sits close to random escalation plus a small offset, and why the oracle gate (28.4) is far above anything the confidence scores reach. An operating point fixed on the calibration split (escalate the least-confident half there) gives 47 % / 44 % escalation and 23.9 / 23.1 accuracy on the evaluation split (first-token / mean-token), again below full-image 256 tokens (27.3).
 
 **Caveats:** TTFT figures are the §8.2 model, not a measured pipeline; one model (TinyLlama nested), one dataset (TextVQA, OCR-heavy), absolute accuracy is low because of the lmms prompt setup; the selected layers come from a 500-question calibration split.
+
+---
+
+## 11. I-1: FastV and other training-free baselines (status, 2026-10-24)
+
+**Implemented [FACT, FlexLLaVA commit d39b65e].** `llava/model/fastv.py` implements FastV as a key mask: the first K = 2 layers see all 576 visual tokens, the lowest-scoring fraction R (by last-token attention at layer K−1, mean over heads) is masked as keys in all later layers, at prefill and during decode. Logits equal those of physically removing the tokens (positions unchanged, as in FastV's reference code). It does *not* reproduce FastV's latency saving, because the dropped tokens' keys and values are still computed; latency has to come from the analytic model or the Orin harness. Self-test (job 27953, on the M3-ladder TinyLlama checkpoint): R = 0 is token-for-token identical to the unpatched model, R = 0.75 keeps 144 of 576 tokens and changes the output, and a left-padded batch of two prompts of different lengths gives the same text as running them one by one.
+
+**Eval design.** Dense TinyLlama-576 (same backbone, vision tower and data as Nest-VLM) with FastV at kept-token counts 256 / 144 / 64 / 16 (R = 1 − n/576), five tasks (MME, POPE, ScienceQA-img, TextVQA, GQA), compared with `final-parcel` at the same token counts and with the dense 576-token numbers (MME-P 1248.3, POPE 84.9, SciQA 57.4, TextVQA 41.0, GQA 58.3). Also planned from the doc: K = 4 as a sensitivity check, and the Orin latency once I-0 exists.
+
+**Blocker found and handled.** The dense checkpoint `baseline-tinyllama-finetune` was deleted in the September cleanup (only its eval logs survive). Stage 2 is being re-trained from the existing plain-projector Stage 1 (`baseline-tinyllama-4tok-pretrain`, trained on all 576 tokens) with the original recipe: job 27952 (A10:2, node208; the original run took 69,983 s ≈ 19.4 h). Chained behind it with `afterok`: the dense re-evaluation (27954, logs under `eval_logs/baseline-tinyllama-576tok-rerun/`) and the FastV array (27955, logs under `eval_logs/baseline-tinyllama-finetune-fastv-k2/<n>tok/`). [INTERP] The re-trained model should land near the old numbers but will not be bit-identical; the re-evaluation tells us how far, and the old numbers in the table above should be replaced by the re-evaluated ones if they differ.
+
+**Results:** pending (§12 once the chain finishes).
