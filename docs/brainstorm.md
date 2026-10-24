@@ -286,3 +286,59 @@ The same table at MAXN_SUPER: vision tower 140–142 ms at every budget, LM pref
 - *Stage C (GPU):* the pilot's `crop` and `globalcrop` tasks answer with these windows (`SRC_TAG=g16 MODE=crop sbatch eval_croppilot_level.sh`).
 
 Results: see §10 once the runs finish.
+
+---
+
+## 10. I-3 results (run 2026-10-23 on DAS-6, TextVQA val, 3,826 evaluation questions)
+
+Source: `croppilot/logs/selfroi_analyze_27934.out` and `selfroi_boxes_27926.out` on DAS-6. The map variant was picked on 500 calibration questions (16-token guide: raw layer 16; 256-token guide: raw layer 17); every number below uses the other 3,826. Paired differences are in points with 95 % CIs. Accuracy is the pilot's lmms TextVQA score, so absolute values are low (full image at 256 tokens = 27.3).
+
+### 10.1 Where does the guide look? (ROI hit rate)
+
+| Box source | GT-box coverage | Centre of the window inside the GT box |
+|---|---|---|
+| 16-token guide | 77.5 % | 81 % |
+| 256-token guide | 85.8 % | 89 % |
+| centre window (same sizes) | 70.9 % | — |
+| random window (same sizes) | 67.2 % | — |
+| GT-centred window (same sizes) | 98.1 % | — |
+
+[FACT] Refutation test for I-3 ("hit rate near a centre crop") **is not met, but the margin is small**: +6.6 points over the centre window at 16 tokens, +14.9 at 256. Window IoU with the GT box is only 7.5 % (16 tok) and 9.7 % (256 tok); on small boxes (n = 637) IoU is 0.5 %, i.e. the window covers the box but is far larger than it.
+
+### 10.2 Accuracy, crop only (windows from the 16-token guide)
+
+| Eval budget | full image | self-ROI (16-tok guide) | centre window | random window | GT-centred window | oracle GT crop |
+|---|---|---|---|---|---|---|
+| 256 tokens | 27.3 | 29.6 | 27.1 | 25.4 | 33.5 | 42.3 |
+| 64 tokens | 22.6 | 24.9 | 21.7 | 21.1 | 27.4 | 39.9 |
+| 16 tokens | 18.6 | 20.4 | 18.0 | 17.5 | 22.1 | 33.6 |
+
+[FACT] Paired gains of self-ROI (16-tok guide) at 64 tokens: +2.4 [+1.3, +3.4] over the full image, +3.2 [+2.1, +4.3] over the centre window, and −2.5 [−3.3, −1.6] against a window centred on the true box with the same size. The oracle crop is +15.0 [+13.5, +16.4] above it (small boxes +23.9). The 256-token guide adds +1.4 to +2.5 over the 16-token guide at the same eval budget (e.g. 26.3 vs 24.9 at 64 tokens).
+
+[FACT] **Small boxes are where it fails.** At 64 tokens self-ROI is +3.9 [+1.7, +6.2] over the full image on small boxes, but only +2.1 [−0.3, +4.4] over the centre window. At 256 tokens, large boxes are *worse* than the full image (−2.5 [−4.8, −0.2]) because the crop discards context.
+
+[FACT] Adding the global image to the crop (two images, no training) helps self-ROI by +1.4 [+0.7, +2.1] at 64 tokens, mostly on large boxes (+3.0), and is neutral on small ones. Oracle crop + image reaches 42.8 at 64 tokens.
+
+### 10.3 Cascade (16-token guide pass, escalate to a 64-token self-ROI crop when not confident)
+
+Guide pass alone: 19.3 accuracy at 267 ms (model, §8.2). Always escalating: 24.9 at 533 ms. Reference: full image at 256 tokens = 27.3 at 381 ms (model).
+
+| Escalate | gate = first-token prob. | gate = mean token prob. | TTFT, model (ms) |
+|---|---|---|---|
+| 0 % | 19.3 | 19.3 | 267 |
+| 40 % | 23.4 | 22.8 | 373 |
+| 50 % | 24.3 | 23.5 | 400 |
+| 60 % | 24.7 | 24.2 | 427 |
+| 80 % | 24.3 | 25.4 | 480 |
+| 100 % | 24.9 | 24.9 | 533 |
+
+Random gate at 40 %: 21.5; oracle gate (escalate only the wrong guide answers): 28.4 at 83 % escalation.
+
+### 10.4 What this settles
+
+1. **[INTERP] As a latency win on this model, I-3 is negative.** The best cascade point (first-token gate, 50–60 % escalation: 24.3–24.7 at 400–427 ms) is *below* simply running the full image at 256 tokens (27.3 at 381 ms) in the §8.2 model, so it is dominated on both axes. Even the oracle gate only reaches 28.4 at 83 % escalation. The two-pass design pays the vision tower twice (§8.1), which is what §8.2 predicted.
+2. **[INTERP] The training-free pixel axis is real but weak.** Self-ROI beats centre and random windows with CIs excluding zero overall (+2.5 to +4.3), so the guide carries signal, and the oracle gap (12–15 points) shows the headroom. But about two thirds of that headroom comes from *where exactly* the box is (GT-centred window with the same size is +3.9 above self-ROI at 256 tokens), and small boxes get almost nothing over a centre crop.
+3. **[INTERP] The guide quality is the lever.** A better guide (256-token) gives +1.4 to +2.5; a free, accurate box (sensor-side, I-10, or a learned ROI head, I-9) is the case where the crop's +12–15 points over a 64-token full image becomes usable without the second tower pass. This strengthens I-9/I-10 relative to I-3, and makes the pre-LLM predictor (I-5) the more promising way to use the gate signal.
+4. **Gate signal.** First-token probability is a usable gate at this budget (40 % escalation gives 23.4 against 21.5 for a random gate), but I-4's AUROC check (≥ 0.7) still needs to be computed from `selfroi_g16_gate.npz`; I have not done that yet.
+
+**Caveats:** TTFT figures are the §8.2 model, not a measured pipeline; one model (TinyLlama nested), one dataset (TextVQA, OCR-heavy), absolute accuracy is low because of the lmms prompt setup; the selected layers come from a 500-question calibration split.
