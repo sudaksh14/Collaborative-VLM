@@ -415,3 +415,58 @@ Source: `scripts/summarize_fastv.py` (job output `croppilot/logs/summarize_fastv
 5. **[INTERP] It reinforces the HR-crop direction.** In the crop pilot, the oracle crop on Nest-VLM at 64 tokens scored 39.9–40.3 TextVQA (§7; the pilot's question subset, so not exactly comparable), i.e. roughly the dense model's 41 at 64 tokens, while FastV at 64 tokens is at 30.2. A crop closes the tax that pruning cannot, but only when the box comes for free (§10).
 
 **Not yet done:** K = 4 and K = 8 sensitivity (jobs 27962 and 27963; FastV at 97 % pruning with K = 2 is known to be harsh, so these decide whether the 16- and 64-token FastV rows are a fair baseline), TinyLLaVA/MobileVLM-architecture baselines, and any Orin measurement (I-0).
+
+---
+
+## 13. Why Nest-VLM trails the dense model: recipe and architecture audit vs M3 / MQT / PARCEL (2026-10-26)
+
+Source: `scripts/summarize_tinyllama.py` over every TinyLlama eval on DAS-6; code read in `llava/model/elastic/resampler.py`, `llava_elastic_mixin.py`, `llava_trainer.py`, the Stage-1/2 launchers and `submit_elastic_run.sh`; profile `results/profile_overhead_elastic-finetune-tinyllama-v8-parcel_NVIDIA_A10.json`.
+
+### 13.1 Same-backbone numbers (TinyLlama-1.1B, CLIP-L/336, LLaVA-1.5 data)
+
+| Model @ visual tokens | MME-P | POPE | SciQA | TextVQA | GQA |
+|---|---|---|---|---|---|
+| dense 576 (TinyLLaVA-equivalent, re-trained) | 1250.2 | 84.58 | 56.52 | 41.19 | 58.39 |
+| **final-parcel** @ 256 / 144 / 64 / 16 | 1170 / 1142 / 1155 / 1124 | 84.3 / 84.2 / 83.0 / 80.5 | 48.1 / 48.1 / 47.5 / 46.4 | **28.5 / 26.3 / 23.7 / 19.7** | 56.1 / 55.3 / 54.5 / 52.6 |
+| MQT ladder (own recipe, budgets 256/144/64/16) | 1194 / 1146 / 1160 / 1146 | 83.2 / 81.9 / 81.2 / 79.4 | 53.3 / 52.9 / 52.9 / 52.3 | 24.9 / 22.7 / 21.6 / 18.4 | 54.8 / 54.2 / 53.4 / 51.8 |
+| parcel-faithful (single budget per step, no KD, no LoRA) | 1089 / 1102 / 1099 / 1046 | 80.2 / 80.2 / 79.9 / 79.1 | 43.9 / 44.1 / 44.6 / 44.3 | 20.5 / 20.0 / 19.6 / 17.9 | 51.3 / 51.0 / 50.8 / 49.8 |
+| v11 = final-parcel without vision LoRA | 1087 / 1117 / 1101 / 987 | 83.5 / 83.5 / 82.4 / 79.7 | 50.2 / 50.4 / 49.6 / 47.5 | 22.2 / 19.3 / 16.2 / 12.1 | 54.0 / 53.6 / 52.5 / 50.3 |
+| final-parcel-576ctrl (same architecture, one level, 576 tokens) | 1113 | 81.8 | 50.7 | 21.2 | 52.6 |
+| M3, 4-token model | 1176 | 80.6 | 53.5 | 17.1 | 54.1 |
+| MQT, 4-token model | 1106 | 78.9 | 51.5 | 14.6 | 50.9 |
+| M3 ladder (256/144/64/16) | trained on Hipster; its eval logs are not on DAS-6; re-evaluating now (job 27967) | | | | |
+
+[FACT] **Against the elastic baseline we have on the same backbone, we are not behind.** final-parcel beats the MQT ladder on TextVQA (+1.3 to +3.7), POPE (+1.1 to +2.3) and GQA (+0.8 to +1.3) at every budget; it loses SciQA by 4.8 to 5.9 and MME-P by 4 to 24 points. It also beats PARCEL-as-published by 8 TextVQA points at 256. The large gap is to the **dense** model (−12.7 TextVQA at 256), and MQT shares it (−16.3).
+
+### 13.2 The missing piece: the tokens the LLM sees are no longer CLIP patch features
+
+[FACT, from the code] At budget 256, final-parcel emits 64 average-pooled anchors plus 192 learned queries. The anchors are not passed through unchanged: they go through a self-attention block jointly with the queries and then the resampler's output LayerNorm, before the projector. The queries come from a two-layer cross-attention stack initialised at random. M3, the dense model and FastV all hand the projector raw (pooled or selected) CLIP patch features.
+
+[FACT] The 576ctrl run isolates this: the same architecture at 576 tokens, with no compression and no ladder (so no elastic training signal and no loss weighting at all), scores TextVQA 21.2 against 41.2 for the dense projector. FastV, which keeps raw patch tokens and only drops some after layer 2, holds 39.6 with 256 tokens and 37.3 with 144.
+
+[INTERP] So most of the deficit is the connector, not elasticity, not the loss and not the LoRA. A randomly initialised resampler trained for one epoch of 558K captions (Stage 1, at the 256 level only) and then at LR 2e-5 inside a 665K Stage 2 does not learn to carry the fine detail (OCR) that the identity path keeps for free. MQT's one-layer resampler has the same problem. PARCEL's published retention comes from a setting we have not matched (its main text does not give the LM training setup; our faithful run is 8 points below final-parcel).
+
+**Prediction to check with job 27967:** if M3's pooled grid at 256/144 tokens lands near 35–40 TextVQA on TinyLlama, the pass-through explanation is confirmed and is the change to make.
+
+### 13.3 What to change (ranked by expected effect)
+
+1. **Anchor pass-through.** Feed anchors as raw pooled CLIP features through the projector (no self-attention, no output LayerNorm) and let queries add detail on top. Raise the anchor share at high budgets (256 = the 16×16 pooled grid with queries only at lower levels, or 144 anchors + 112 queries). This keeps M3's robustness and spends queries only where pooling loses information.
+2. **Warm start from the dense model.** Initialise Stage 2 from `baseline-tinyllama-finetune` (LM and projector already aligned to raw CLIP tokens; the checkpoint exists again) instead of a fresh LM.
+3. **Train every level in Stage 1** (today Stage 1 trains only the 256 level, rank 64), and give the resampler its own LR in Stage 2 (it currently shares the projector's 2e-5).
+4. Loss weighting: second-order (13.5).
+
+### 13.4 Vision LoRA (question 1)
+
+[FACT] Nested, level-specialised LoRA is the largest single accuracy gain in the ablations: v8 vs v11 TextVQA +6.3 / +7.1 / +7.5 / +7.6 (256 / 144 / 64 / 16), MME-P +84 / +25 / +54 / +137, GQA +2.1 to +2.3, POPE about +0.8; it costs SciQA 1.1 to 2.3. A shared rank-16 adapter (v10) is worse than none at 256 and better at 16, and the reversed rank ladder (v14) loses at 256, so per-level nesting, not capacity, is what helps.
+
+[FACT, A10 profile] Unmerged LoRA nearly doubles the vision tower's time: 23.2–24.0 ms with LoRA vs 12.9–13.2 ms without at 144/64/16 tokens (41 ms at 256, noisy), independent of rank, so it is kernel-launch overhead, not FLOPs. TTFT is about 44 ms at *every* budget on the A10, because the LM prefill is also flat (17.8–18.6 ms for 117 to 309 tokens).
+
+[INTERP] Keep the LoRA and remove its latency by merging the active level into the CLIP weights (W + B_ℓA_ℓ) at level switch, which costs nothing at run time. The cost is memory for merged copies (about 0.6 GB per CLIP-L copy in FP16) or a one-off merge per switch. Side effect: with a level-specialised tower the encoder output differs per level, so §2's "escalate tokens without a second encoder pass" is not available for this model.
+
+### 13.5 Loss weighting and MOO (question 4)
+
+[FACT] Current per-step loss: mean CE over {256, one sampled level} + 0.1 × prefix-KL to the 256 level, i.e. effective weights of about 0.5 on 256 and about 0.17 on each other level. [INTERP] Weighting cannot explain the dense gap: 576ctrl puts all weight on a single level and is still at 21.2. In Elastoformer-MOO (SmolLM2-360M, one seed), a fixed 3× weight on the full model moved full-model perplexity by about 1.7 % and the smallest configuration by about 10 %; hypervolume weighting did not beat fixed 3×, and its weights drifted toward the smallest configuration. Recommendation: keep fixed weights now, revisit after the connector change, and use a sandwich (largest + smallest + one random) if the low levels need more signal.
+
+### 13.6 Latency in the objective (question 3)
+
+[INTERP] Training needs no latency term: the budgets are discrete and the token count is the cost knob. Report FLOPs and parameters as the hardware-independent cost, but note that FLOPs mis-rank configurations on real hardware here: on the A10 and on the Orin (§8.1), TTFT is flat across 16–256 tokens because the vision tower and the weight-bound LM prefill dominate, and the LoRA overhead is invisible to FLOPs. A FLOPs-only paper is defensible for the method, but any latency claim (the FastV comparison in §12, the LoRA question) needs one measured table. The A10 profile is a usable stand-in until the Orin (I-0) is available.
