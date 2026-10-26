@@ -375,4 +375,43 @@ Random gate at 40 %: 21.5; oracle gate (escalate only the wrong guide answers): 
 
 **Blocker found and handled.** The dense checkpoint `baseline-tinyllama-finetune` was deleted in the September cleanup (only its eval logs survive). Stage 2 is being re-trained from the existing plain-projector Stage 1 (`baseline-tinyllama-4tok-pretrain`, trained on all 576 tokens) with the original recipe: job 27952 (A10:2, node208; the original run took 69,983 s ≈ 19.4 h). Chained behind it with `afterok`: the dense re-evaluation (27954, logs under `eval_logs/baseline-tinyllama-576tok-rerun/`) and the FastV array (27955, logs under `eval_logs/baseline-tinyllama-finetune-fastv-k2/<n>tok/`). The dense checkpoint was not on the SURFdrive share (checked 2026-10-24: only `baseline-tinyllama-4tok-pretrain` and `baseline-tinyllama-ladder-finetune` among the baselines), so an upload of the new `baseline-tinyllama-finetune` (without its `checkpoint-N/` optimizer states) is chained behind the training as job 27956. [INTERP] The re-trained model should land near the old numbers but will not be bit-identical; the re-evaluation tells us how far, and the old numbers in the table above should be replaced by the re-evaluated ones if they differ.
 
-**Results:** pending (§12 once the chain finishes).
+**Results:** §12.
+
+---
+
+## 12. I-1 results: FastV (K = 2) on the dense backbone vs Nest-VLM (run 2026-10-24 to 26 on DAS-6, full benchmarks)
+
+Source: `scripts/summarize_fastv.py` (job output `croppilot/logs/summarize_fastv_*.out`). FastV rows use the *re-trained* dense TinyLlama-576 (A10:2, finished 2026-10-26); Nest-VLM rows are `final-parcel` (v8-parcel). "Kept" is the number of visual tokens visible from layer 2 on; the first two layers always see all 576. MME-P is the perception score; the other columns are percentages.
+
+| Config | MME-P | POPE | SciQA | TextVQA | GQA |
+|---|---|---|---|---|---|
+| dense 576, old checkpoint (deleted; from eval logs) | 1248.3 | 84.89 | 57.36 | 41.00 | 58.30 |
+| dense 576, re-trained | 1250.2 | 84.58 | 56.52 | 41.19 | 58.39 |
+| FastV keep 256 | 1235.7 | 84.39 | 51.91 | 39.63 | 57.52 |
+| Nest-VLM @ 256 | 1170.3 | 84.33 | 48.14 | 28.47 | 56.07 |
+| FastV keep 144 | 1196.4 | 82.96 | 51.71 | 37.30 | 56.36 |
+| Nest-VLM @ 144 | 1142.2 | 84.23 | 48.09 | 26.34 | 55.30 |
+| FastV keep 64 | 1132.7 | 77.32 | 50.57 | 30.23 | 52.39 |
+| Nest-VLM @ 64 | 1155.1 | 83.03 | 47.45 | 23.73 | 54.52 |
+| FastV keep 16 | 744.0 | 59.90 | 46.26 | 14.98 | 42.77 |
+| Nest-VLM @ 16 | 1123.9 | 80.49 | 46.36 | 19.71 | 52.61 |
+
+[FACT] **The re-trained dense model reproduces the deleted one** (TextVQA 41.19 vs 41.00, MME-P 1250.2 vs 1248.3, GQA 58.39 vs 58.30, POPE −0.3, SciQA −0.8), so FastV is measured on the same dense baseline the journal used. The checkpoint is now also on the SURFdrive share.
+
+**Retention against each method's own full-budget model [computed from the table; Nest's own 256-token level is its reference, the dense model is FastV's]:**
+
+| Kept tokens | FastV TextVQA | Nest TextVQA | FastV POPE | Nest POPE | FastV GQA | Nest GQA |
+|---|---|---|---|---|---|---|
+| 144 | 90.6 % | 92.5 % | 98.1 % | 99.9 % | 96.5 % | 98.6 % |
+| 64 | 73.4 % | 83.3 % | 91.4 % | 98.5 % | 89.7 % | 97.2 % |
+| 16 | 36.4 % | 69.2 % | 70.8 % | 95.4 % | 73.3 % | 93.8 % |
+
+**What this settles**
+
+1. **[FACT] "Elastic beats pruning" holds below about 64 tokens and not above.** At 16 tokens Nest-VLM wins every benchmark except SciQA (tie, 46.4 vs 46.3), by 380 MME-P points, 20.6 POPE, 4.7 TextVQA, 9.8 GQA. At 64 tokens it wins POPE (+5.7), GQA (+2.1), MME-P (+22) and loses TextVQA (−6.5) and SciQA (−3.1). At 256 and 144 tokens FastV is ahead on TextVQA by 11–13 points, SciQA by 3.6–3.8 and MME-P by 54–65.
+2. **[INTERP] The comparison is not "same backbone".** Most of FastV's absolute lead at ≥ 64 tokens is the architecture tax already in the journal (§23): the NTR/anchor model sits at 28.5 TextVQA at its own best level against 41.2 for the dense projector, a 12.7-point gap that exists before any pruning. In retention terms Nest degrades much more gracefully (TextVQA 83 % at 64 tokens against FastV's 73 %; at 16 tokens 69 % against 36 %). The claim we can defend is about robustness at low budgets, not about absolute accuracy at moderate ones.
+3. **[FACT] I-1's refutation test ("FastV@64 matches Nest-VLM@64 on accuracy at lower TTFT") is not met on accuracy** (mixed: FastV better on TextVQA and SciQA, Nest better on POPE, GQA and MME-P), and TTFT is not lower for FastV in the model below, so the idea is not refuted; but the unconditional claim is not supported either.
+4. **[INTERP, extrapolated model, not measured] FastV's TTFT floor is a little above Nest's.** Using §8.2's per-stage numbers (tower 184.5 ms, projector ≈ 1 ms), the 22-layer LM at 2/22 of its cost on the full 627-token sequence (LM(627) ≈ 419 ms, linearly extrapolated from the 195 → 307 token slope of 0.72 ms/token, which is a guess) plus 20/22 of LM(n + 51): FastV ≈ 395 / 322 / 292 / 291 ms at 256 / 144 / 64 / 16 kept tokens against Nest's measured 393 / 307 / 272 / 272. So FastV is 2 to 21 ms slower at equal kept tokens. **Caveat that can flip this:** the same §8.1 analysis suspects Nest's 184 ms tower is ≈ 70–80 ms inflated by the unmerged nested LoRA, while a dense tower should be nearer 105–115 ms. If that is right, FastV would be about 60–80 ms *faster* than Nest at every budget until the LoRA is merged, which would reverse the latency half of the story. The merge check in I-0 is therefore decisive for this comparison.
+5. **[INTERP] It reinforces the HR-crop direction.** In the crop pilot, the oracle crop on Nest-VLM at 64 tokens scored 39.9–40.3 TextVQA (§7; the pilot's question subset, so not exactly comparable), i.e. roughly the dense model's 41 at 64 tokens, while FastV at 64 tokens is at 30.2. A crop closes the tax that pruning cannot, but only when the box comes for free (§10).
+
+**Not yet done:** K = 4 and K = 8 sensitivity (jobs 27962 and 27963; FastV at 97 % pruning with K = 2 is known to be harsh, so these decide whether the 16- and 64-token FastV rows are a fair baseline), TinyLLaVA/MobileVLM-architecture baselines, and any Orin measurement (I-0).
