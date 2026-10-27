@@ -498,15 +498,52 @@ Source: `scripts/summarize_tinyllama.sh` output `croppilot/logs/summarize_tinyll
 
 [FACT, journal §7-8] Our NTR **is** PARCEL's PCQR: pooled anchors + a self-attention block over [anchors; queries] + cross-attention of the pool-aware queries to the raw ViT patches. PARCEL's claimed win is on *retention relative to each method's own full-budget model*, against MQT/M3 trained in their own setting, not against a dense model in absolute scores.
 
-[FACT, journal §8-note] final-parcel (v8) deviates from PARCEL's routing: PARCEL uses 16 anchors below B = 64 and 64 anchors up to B = 256, i.e. N_q = 0 at 16 and 64 tokens; v8 uses {256:64, 144:36, 64:16, 16:4}. **Correction (2026-10-27):** the literal-routing run already exists as `parcel-faithful` ({256:64, 144:64, 64:64, 16:16}, single budget per step, no LoRA, no KD) and it is *worse*, not better: at 64 tokens, where it is 64 pure anchors, TextVQA is 19.6 vs 30.6 for M3 and 23.7 for final-parcel. So routing is not what costs us at the low budgets; the pure-anchor path itself (`out_ln(anchors)` on the pooled CLIP features, `resampler.py:529`, trained by the Stage-1/2 recipe) loses 11 TextVQA points to raw pooling.
+[FACT, journal §8-note] final-parcel (v8) deviates from PARCEL's routing: PARCEL uses 16 anchors below B = 64 and 64 anchors up to B = 256, i.e. N_q = 0 at 16 and 64 tokens; v8 uses {256:64, 144:36, 64:16, 16:4}. **Correction (2026-10-27, replaces an earlier wrong correction):** the `parcel-faithful` run was meant to be the literal routing ({256:64, 144:64, 64:64, 16:16}) but the `pool_anchored` code always keeps at least one query (`n_anchors_for` snaps the anchor count down until it is below the budget), so it actually trained **9 anchors + 7 queries at 16 tokens and 36 + 28 at 64 tokens**, with post-self-attention anchors; it never ran a pure-anchor budget (unit-tested in `jobs/test_parcel_exact.sh`). So the literal-PARCEL connector had **not** been tested before 2026-10-27; it is now `resampler_arch=parcel_exact` (section 15).
 
 [FACT, journal measurements] Effective rank at 256 tokens: the 192 learned queries alone have 26.8 effective dimensions (13.9 %), the 64 anchors 62.6 (97.9 %), the full set 43.8 (17.1 %); the queries are more collapsed than the plain query baseline's.
 
-[INTERP] The gap is therefore (1) the queries add little unique information and are randomly initialised and trained for one epoch at one level, whereas M3 adds no parameters and keeps the Stage-1 projector aligned with raw CLIP features, (2) the anchors pass through self-attention and an output LayerNorm that raw-feature baselines (and, per Fig. 4, PARCEL's own anchors) skip; parcel-faithful's pure-anchor 64-token level, which is only pooling + that path, scores 19.6 TextVQA vs M3's 30.6, which points at this path and at the recipe, not at the queries. Neither is yet tested in isolation.
+[INTERP] The gap is therefore (1) the queries add little unique information and are randomly initialised and trained for one epoch at one level, whereas M3 adds no parameters and keeps the Stage-1 projector aligned with raw CLIP features, (2) the anchors pass through self-attention and an output LayerNorm that raw-feature baselines (and, per Fig. 4, PARCEL's own anchors) skip, and the low budgets spend tokens on queries (parcel-faithful: 9+7 and 36+28), where PARCEL and M3 use pure pooling. Neither is yet tested in isolation; the parcel-exact runs of section 15 test both at once.
 
 ### 14.4 Next steps (decision-relevant, in order)
 
-1. ~~PARCEL-literal routing run~~: already done as `parcel-faithful` (14.3 correction); it does not help. Replaced by a **pass-through connector**: pooled anchors skip the self-attention block and the output LayerNorm and go to the projector raw, as in PARCEL's Fig. 4 and Eq. 1 (the paper concatenates P, Q_SE and the text tokens; our code emits the post-self-attention anchors, `resampler.py:507-510, 545, 555`).
+1. **PARCEL pipeline** (section 15): raw pass-through anchors, PARCEL's literal routing with pure-anchor budgets, uniform budget sampling, plain cross-entropy. `parcel-faithful` did not test this (it ran 9+7 / 36+28 with post-self-attention anchors).
 2. **Anchor pass-through + dense/M3-aligned warm start + all levels in Stage 1** (§13.3 items 1-3) in one run, then ablate.
 3. **M3 ladder + nested vision LoRA** as a serious alternative system: no resampler, and the LoRA gave +6 to +8 TextVQA in the Nest ablations (§13.4). If it beats the best NTR variant, the elastic-token mechanism should be pooling and the paper's contribution moves to the LoRA, the crop and the controller.
 4. Hold the HR-crop work (I-2) until one of 1-3 closes the connector gap; the crop gains are measured on a Nest model that trails plain pooling.
+
+
+## 15. The PARCEL pipeline (built 2026-10-27, next to Nest-VLM, not instead of it)
+
+Source: PARCEL (arXiv 2605.30126) Sec. 3.2-3.3, Fig. 4 and Appendix E; code in `llava/model/elastic/{resampler,engine,config}.py`, `llava/model/language_model/llava_elastic_mixin.py`, recipes `parcel-exact-nolora` / `parcel-exact-lora` in `submit_elastic_run.sh`; tests `jobs/test_parcel_exact.sh` (14 checks, pass) and `jobs/smoke_parcel_exact.sh`. The Nest-VLM pipeline (`pool_anchored`, `final-parcel`) is untouched.
+
+### 15.1 What the paper specifies and what the new pipeline does
+
+| | PARCEL (paper) | `parcel_exact` here |
+|---|---|---|
+| Anchors | pooled, **concatenated to the output as-is** (Fig. 4, Sec. 3.2) | raw avg-pooled anchors, bit-identical in the output (unit test) |
+| Connector blocks | one Query<->Pool self-attention + one Query->ViT cross-attention (App. E) | exactly these, depth 1 enforced; only the updated queries leave the self-attention block |
+| Routing | 16 <= B < 64: 4x4 = 16 anchors; 64 <= B <= 256: 8x8 = 64 anchors; N_q = B - N_p | the same step function; B = 16 and B = 64 are **pure-anchor budgets** (== M3 pooling) |
+| Budgets in training | B ~ even values in [16, 256], one per step | B ~ Uniform{16, 18, ..., 256}, one forward per step, arbitrary B (not a ladder entry) |
+| Loss | PaliGemma-2 recipe; **no distillation, no teacher** is described | plain next-token cross-entropy on response tokens: KD, CORAL, decorrelation all off |
+| LR / optimiser | Adam(W) defaults, LR 2e-5 x 0.5 = 1e-5 (App. E) | AdamW, Stage 2 LR 1e-5 (Stage 1 keeps the connector-only 1e-3 of the LLaVA recipe) |
+| Data | PaliGemma-2 mixtures, 100M + 100M samples, global batch 8192 | unchanged LLaVA-1.5 (558K + 665K), batch 128 |
+| Encoder | SigLIP-so400m/14 at 224 (256 patches), trainable | CLIP-L/336 (576 patches), frozen or nested vision LoRA |
+| Choices the paper leaves open | final norm, positional embeddings, head count | LayerNorm on the queries only (flag), no extra positional embeddings, 8 heads (12 when the width is 1152) |
+
+[FACT] The anchor counts (16 and 64) are the paper's, but on our 24 x 24 CLIP grid they are 6 x 6 and 3 x 3 pooling blocks (the paper's 16 x 16 SigLIP grid pools 4 x 4 and 2 x 2): 64 anchors are 11 % of our 576 patches against 25 % of PARCEL's 256, so our anchors are relatively finer, and our 256-token budget is a compression of the grid where PARCEL's 256 is the uncompressed grid.
+
+### 15.2 Is there KD from a larger model in PARCEL?
+
+[FACT, from the pages read: main text and Appendix E] No. PARCEL describes only the PaliGemma-2 pretraining recipe (nested dropout over budgets, per-benchmark transfer tuning); no teacher, no distillation term and no auxiliary loss is mentioned. The loss is the standard autoregressive cross-entropy of PaliGemma-2, which the pipeline reproduces. (Appendix pages 21-28 were not read; they are results, FLOP and benchmark details.)
+
+### 15.3 Runs
+
+parcel-exact-nolora (train 27983, eval 27984) and parcel-exact-lora (train 27985, eval 27986) are queued behind the smoke gate (27982, `afterok`), on node208 A10:2 one after the other with identical settings (one world size, so the only difference is the vision LoRA). Unit tests 27979 and the two older regression tests (27980, 27981) pass.
+
+### 15.4 Would SigLIP-so400m change the picture? (decision: not queued yet)
+
+[FACT] There is **no SigLIP accuracy result in our logs**. Two TinyLlama + so400m-384 runs (`elastic-finetune-tinyllama-v8-siglip-so400m-parcel`, fixed anchors 81/9/9/1, and the `-adaptive-parcel` variant) finished training on 2026-09-28/29 (5197/5197 steps) but were never evaluated; the other SigLIP runs were 6-step smoke tests (journal section 22). Evaluation of the first one is queued (job 27987, node207, 4 levels in sequence): it is the clean encoder swap inside the Nest-VLM pipeline (same recipe as final-parcel, CLIP replaced by so400m-384).
+
+[INTERP, from 2 x params x tokens, not measured] Latency depends on the resolution, not only the model: so400m has 428M parameters against CLIP-L's 304M (1.41x). At 384 px it sees 729 patches (about 0.69 TFLOPs, roughly 1.8x CLIP-L/336's 0.38), so it is slower; at 224 px it sees 256 patches (about 0.23 TFLOPs, 0.6x), so it is faster, at the price of OCR resolution (TextVQA). PARCEL itself uses so400m at 224 (and a 448 variant for high resolution).
+
+[INTERP] An encoder swap lifts every method that uses it (dense, M3, FastV, Nest, PARCEL) and does not touch the connector problem of sections 13-14, so it cannot by itself decide Nest/PARCEL against pooling; a SigLIP comparison is only interpretable with a SigLIP dense baseline and a SigLIP M3 ladder next to it, which do not exist. Queue it only if (a) the 27987 evaluation shows a clear encoder gain at equal budget, and (b) the CLIP parcel-exact runs show the connector is no longer the bottleneck. The recipes `parcel-exact-so400m224-nolora|lora` are ready (`submit_elastic_run.sh`; the so400m-224 weights must be downloaded once, the compute nodes are offline).
