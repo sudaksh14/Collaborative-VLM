@@ -538,7 +538,7 @@ Source: PARCEL (arXiv 2605.30126) Sec. 3.2-3.3, Fig. 4 and Appendix E; code in `
 
 ### 15.3 Runs
 
-parcel-exact-nolora (train 27983, eval 27984) and parcel-exact-lora (train 27985, eval 27986) are queued behind the smoke gate (27982, `afterok`), on node208 A10:2 one after the other with identical settings (one world size, so the only difference is the vision LoRA). Unit tests 27979 and the two older regression tests (27980, 27981) pass.
+parcel-exact-nolora (train 27983, eval 27984) and parcel-exact-lora (train 27989, eval 27990; first submitted as 27985, cancelled because it landed on the excluded node205) are queued behind the smoke gate (27982, passed), on node208 A10:2 one after the other (27989 is `afterany:27983`) with identical settings (one world size, so the only difference is the vision LoRA). Unit tests 27979 and the two older regression tests (27980, 27981) pass.
 
 ### 15.4 Would SigLIP-so400m change the picture? (decision: not queued yet)
 
