@@ -434,7 +434,7 @@ Source: `scripts/summarize_tinyllama.py` over every TinyLlama eval on DAS-6; cod
 | final-parcel-576ctrl (same architecture, one level, 576 tokens) | 1113 | 81.8 | 50.7 | 21.2 | 52.6 |
 | M3, 4-token model | 1176 | 80.6 | 53.5 | 17.1 | 54.1 |
 | MQT, 4-token model | 1106 | 78.9 | 51.5 | 14.6 | 50.9 |
-| M3 ladder (256/144/64/16) | trained on Hipster; its eval logs are not on DAS-6; re-evaluating now (job 27967) | | | | |
+| **M3 ladder** (256/144/64/16; re-evaluated 2026-10-27, job 27973) | 1252 / 1255 / 1253 / 1245 | 84.5 / 84.6 / 83.9 / 82.6 | 56.8 / 56.9 / 55.4 / 53.7 | **35.1 / 34.3 / 30.6 / 21.2** | 57.9 / 58.2 / 57.7 / 55.7 |
 
 [FACT] **Against the elastic baseline we have on the same backbone, we are not behind.** final-parcel beats the MQT ladder on TextVQA (+1.3 to +3.6), POPE (+1.1 to +2.3) and GQA (+0.8 to +1.3) at every budget; it loses SciQA by 4.8 to 5.9 and MME-P by 4 to 24 points. It also beats our PARCEL reproduction (parcel-faithful) by 8 TextVQA points at 256. The large gap is to the **dense** model (−12.7 TextVQA at 256), and MQT shares it (−16.3).
 
@@ -470,3 +470,43 @@ Source: `scripts/summarize_tinyllama.py` over every TinyLlama eval on DAS-6; cod
 ### 13.6 Latency in the objective (question 3)
 
 [INTERP] Training needs no latency term: the budgets are discrete and the token count is the cost knob. Report FLOPs and parameters as the hardware-independent cost, but note that FLOPs mis-rank configurations on real hardware here: on the A10 and on the Orin (§8.1), TTFT is flat across 16–256 tokens because the vision tower and the weight-bound LM prefill dominate, and the LoRA overhead is invisible to FLOPs. A FLOPs-only paper is defensible for the method, but any latency claim (the FastV comparison in §12, the LoRA question) needs one measured table. The A10 profile is a usable stand-in until the Orin (I-0) is available.
+
+## 14. Results update 2026-10-27: M3 ladder and FastV K-sensitivity (DAS-6 jobs 27962, 27963, 27973; summary job 27977)
+
+Source: `scripts/summarize_tinyllama.sh` output `croppilot/logs/summarize_tinyllama_27977.out`. Single seed, TinyLlama-1.1B, CLIP-L/336, LLaVA-1.5 data. The M3 ladder checkpoint was trained on the Hipster cluster; its recipe was not re-verified against ours here.
+
+### 14.1 M3 ladder: the §13.2 prediction holds, and M3 beats final-parcel everywhere
+
+[FACT] M3 ladder at 256 / 144 / 64 / 16 tokens: TextVQA 35.1 / 34.3 / 30.6 / 21.2 (§13.2 predicted 35-40 at 256/144: 256 is at the bottom of the range, 144 a hair under). Against final-parcel (TextVQA 28.5 / 26.3 / 23.7 / 19.7) M3 is better on **all five tasks at all four budgets**: TextVQA +6.6 / +7.9 / +6.9 / +1.4, SciQA +7 to +9, MME-P +82 to +121, GQA +1.8 to +3.1, POPE +0.2 to +2.1. It is also well above our MQT ladder (24.9 / 22.7 / 21.6 / 18.4).
+
+[FACT] M3 vs the dense 576 model (TextVQA 41.2): −6.1 at 256, −6.9 at 144, −10.6 at 64, −20.0 at 16. M3 vs FastV K=2 on TextVQA: FastV is better at 256 (39.6 vs 35.1) and 144 (37.3 vs 34.3), level at 64 (30.2 vs 30.6), and M3 wins clearly at 16 (21.2 vs 15.0). On MME-P, POPE, SciQA and GQA the M3 ladder is flat across budgets (MME-P 1245-1255).
+
+[INTERP] The connector explanation of §13.2 is supported (raw pooled CLIP features through the projector reach 35 TextVQA at 256, final-parcel's learned queries 28.5), but only as "pooling with no new parameters beats our resampler"; it still does not isolate which part of the resampler (random init, anchor self-attention + LayerNorm, queries, training budget) is responsible.
+
+### 14.2 FastV K-sensitivity (K = 2 / 4 / 8)
+
+| kept tokens | TextVQA K2 / K4 / K8 | SciQA K2 / K4 / K8 | MME-P K2 / K4 / K8 |
+|---|---|---|---|
+| 256 | 39.6 / 39.0 / 38.5 | 51.9 / 51.5 / 44.5 | 1236 / 1238 / 1222 |
+| 144 | 37.3 / 36.5 / 36.7 | 51.7 / 51.7 / 44.3 | 1196 / 1211 / 1198 |
+| 64 | 30.2 / 29.1 / 30.5 | 50.6 / 49.3 / 44.4 | 1133 / 1120 / 1064 |
+| 16 | 15.0 / 13.5 / 13.8 | 46.3 / 46.2 / 42.6 | 744 / 742 / 742 |
+
+[FACT] Moving the pruning layer deeper does not rescue the high-pruning rows (TextVQA at 16 tokens 13.5-15.0 for every K; K = 8 loses about 7 SciQA points). [INTERP] K = 2 is a fair FastV baseline; §12's conclusions stand, and FastV at 97 % pruning is simply bad, not mis-tuned.
+
+### 14.3 Why our NTR trails M3 although PARCEL reports it beating M3/MQT
+
+[FACT, journal §7-8] Our NTR **is** PARCEL's PCQR: pooled anchors + a self-attention block over [anchors; queries] + cross-attention of the pool-aware queries to the raw ViT patches. PARCEL's claimed win is on *retention relative to each method's own full-budget model*, against MQT/M3 trained in their own setting, not against a dense model in absolute scores.
+
+[FACT, journal §8-note] We deviate from PARCEL's routing: PARCEL uses 16 anchors below B = 64 and 64 anchors up to B = 256, i.e. **N_q = 0 (pure M3 pooling) at 16 and 64 tokens**. v8-parcel uses {256:64, 144:36, 64:16, 16:4}, so at 16 and 64 tokens it replaces pooling with 4 anchors + 12 queries and 16 anchors + 48 queries. That is exactly where it now loses to M3 (64 tokens: TextVQA 23.7 vs 30.6; 16 tokens: MME-P 1124 vs 1245).
+
+[FACT, journal measurements] Effective rank at 256 tokens: the 192 learned queries alone have 26.8 effective dimensions (13.9 %), the 64 anchors 62.6 (97.9 %), the full set 43.8 (17.1 %); the queries are more collapsed than the plain query baseline's.
+
+[INTERP] The gap is therefore (1) the queries add little unique information and are randomly initialised and trained for one epoch at one level, whereas M3 adds no parameters and keeps the Stage-1 projector aligned with raw CLIP features, (2) at low budgets we spend tokens on queries where PARCEL (and M3) would spend them all on a pooled grid, and (3) the anchors pass through self-attention and an output LayerNorm that raw-feature baselines skip. None of these is yet tested in isolation.
+
+### 14.4 Next steps (decision-relevant, in order)
+
+1. **PARCEL-literal routing run** (anchors 16 at B = 16, 64 at B = 64; 64 + queries above): cheapest test of 14.3 point 2, and it makes the 16/64 levels equal to pooling by construction.
+2. **Anchor pass-through + dense/M3-aligned warm start + all levels in Stage 1** (§13.3 items 1-3) in one run, then ablate.
+3. **M3 ladder + nested vision LoRA** as a serious alternative system: no resampler, and the LoRA gave +6 to +8 TextVQA in the Nest ablations (§13.4). If it beats the best NTR variant, the elastic-token mechanism should be pooling and the paper's contribution moves to the LoRA, the crop and the controller.
+4. Hold the HR-crop work (I-2) until one of 1-3 closes the connector gap; the crop gains are measured on a Nest model that trails plain pooling.
