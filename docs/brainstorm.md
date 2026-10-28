@@ -552,3 +552,38 @@ parcel-exact-nolora (train 27983, eval 27984) and parcel-exact-lora (train 27989
 
 - `lora_small_budget_max=30` (new, default 0 = off): under uniform sampling, B in {16..30} uses the level-16 (rank-64) vision-LoRA adapter. The plain smallest-level->=B rule gave rank 64 only to B = 16 (1 step in 121). Enabled for the parcel-exact `*-lora` recipes from now on; the CLIP LoRA run 27993 started before this and uses the plain rule, so CLIP-vs-SigLIP LoRA comparisons carry this extra difference.
 - Queued on hipster (`performance`, 4x RTX 6000 Ada, checkpoints under `/scratch/skalra/flexllava_saves/checkpoints`): `parcel-exact-so400m224-nolora` train 381317 / eval 381318, `parcel-exact-so400m224-lora` train 381319 / eval 381320. Both run at the same time, queued separately.
+
+
+## 16. Results update 2026-10-28: SigLIP-so400m/384 inside the Nest-VLM pipeline (DAS-6 eval 27987)
+
+Checkpoint `elastic-finetune-tinyllama-v8-siglip-so400m-parcel`: the final-parcel recipe (`pool_anchored`, frozen encoder) with CLIP-L/336 replaced by SigLIP-so400m/384 (27 x 27 = 729 patches). Anchor routing (from its `elastic_config.json`) is **{256: 81, 144: 9, 64: 9, 16: 1}**, against final-parcel's {256: 64, 144: 36, 64: 16, 16: 4}. Single seed, full benchmarks.
+
+| tokens | config | MME-P | POPE | SciQA | TextVQA | GQA |
+|---|---|---|---|---|---|---|
+| 576 | dense CLIP (reference) | 1250.2 | 84.58 | 56.52 | 41.19 | 58.39 |
+| 256 | Nest SigLIP-384 | 1256.1 | 84.33 | 51.02 | **38.36** | **58.86** |
+| 256 | Nest CLIP (final-parcel) | 1170.3 | 84.33 | 48.14 | 28.47 | 56.07 |
+| 256 | M3 ladder CLIP | 1252.1 | 84.48 | 56.77 | 35.08 | 57.85 |
+| 144 | Nest SigLIP-384 | 1195.1 | 82.62 | 49.93 | 28.62 | 56.27 |
+| 144 | Nest CLIP | 1142.2 | 84.23 | 48.09 | 26.34 | 55.30 |
+| 144 | M3 ladder CLIP | 1255.0 | 84.64 | 56.92 | 34.25 | 58.17 |
+| 64 | Nest SigLIP-384 | 1176.3 | 82.89 | 49.68 | 28.87 | 56.08 |
+| 64 | Nest CLIP | 1155.1 | 83.03 | 47.45 | 23.73 | 54.52 |
+| 64 | M3 ladder CLIP | 1253.1 | 83.94 | 55.38 | 30.58 | 57.68 |
+| 16 | Nest SigLIP-384 | 1031.2 | 79.52 | 49.18 | 21.34 | 51.54 |
+| 16 | Nest CLIP | 1123.9 | 80.49 | 46.36 | 19.71 | 52.61 |
+| 16 | M3 ladder CLIP | 1245.1 | 82.57 | 53.69 | 21.15 | 55.69 |
+
+[FACT] At 256 tokens the encoder swap gives +9.9 TextVQA (28.5 -> 38.4), +2.8 GQA, +2.9 SciQA and +86 MME-P over final-parcel; it is the first Nest/PARCEL-family model above the CLIP M3 ladder on TextVQA (+3.3) and GQA (+1.0), and 2.8 TextVQA below the dense CLIP model. SciQA stays 5.8 below M3 at every budget.
+
+[FACT] Below 256 the gain collapses: TextVQA 38.4 -> 28.6 from 256 to 144 (CLIP Nest loses 2.1 over the same step), 144 and 64 are equal (28.6 / 28.9), and at 16 tokens MME-P (1031) and GQA are **below** CLIP Nest. At 144 and 64 it trails the CLIP M3 ladder by 5.6 and 1.7 TextVQA.
+
+[INTERP] TextVQA follows the **anchor count**, not the token count: 81 anchors -> 38.4; 9 anchors at both 144 and 64 tokens -> the same 28.6-28.9, although the 144 level has 135 queries against 55; 1 anchor at 16 -> the MME-P collapse. This is the cleanest evidence so far for §14.3 (the learned queries contribute little; the pooled anchors carry the visual information) and it supports parcel-exact's pure-anchor budgets. The 256-level gain is therefore mostly 81 finer anchors from a stronger encoder, not a better connector.
+
+[INTERP] Encoder decision (§15.4 condition a): **met at 256, not at lower budgets**, and confounded by the anchor routing. It does not yet justify a SigLIP dense baseline + SigLIP M3 ladder; the so400m-224 parcel-exact runs on hipster (16 / 64 anchors, same routing as the CLIP parcel-exact runs) are the cleaner encoder comparison.
+
+### 16.1 Status of the runs from section 15 (2026-10-28)
+
+- `parcel-exact-nolora` (CLIP, node208): training 27983 at step 3334/5197, about 10 h left; eval 27984 (4 levels, about 40 min each) follows.
+- `parcel-exact-lora` (CLIP, node205): training 27997 at step 1834/5197, about 30 h left (31.8 s/step vs 19.4 s/step for the no-LoRA run); eval 27998 follows.
+- hipster `parcel-exact-so400m224-{nolora,lora}` (381317 / 381319): still pending on priority, not started.
