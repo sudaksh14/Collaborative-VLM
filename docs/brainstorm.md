@@ -587,3 +587,38 @@ Checkpoint `elastic-finetune-tinyllama-v8-siglip-so400m-parcel`: the final-parce
 - `parcel-exact-nolora` (CLIP, node208): training 27983 at step 3334/5197, about 10 h left; eval 27984 (4 levels, about 40 min each) follows.
 - `parcel-exact-lora` (CLIP, node205): training 27997 at step 1834/5197, about 30 h left (31.8 s/step vs 19.4 s/step for the no-LoRA run); eval 27998 follows.
 - hipster `parcel-exact-so400m224-{nolora,lora}` (381317 / 381319): still pending on priority, not started.
+
+
+## 17. Results update 2026-11-02: the PARCEL-literal pipeline (parcel_exact), CLIP and SigLIP-so400m/224
+
+Four runs finished: DAS-6 `parcel-exact-nolora` (train 27983, eval 27984; 5197 steps, 29.2 h) and `parcel-exact-lora` (27997, eval 27998; 46.6 h); hipster `parcel-exact-so400m224-nolora` (381317, eval 381318; 9.2 h) and `-lora` (381319, eval 381320; 14.5 h). Single seed, TinyLlama-1.1B, full benchmarks. Hipster eval logs were read from `~/FlexLLaVA/jobs/eval_lmms_hipster_<job>_tok<i>.out`. Routing is PARCEL's: 64 anchors at 256 (plus 192 queries) and 144 (plus 80), pure 64 anchors at 64, pure 16 anchors at 16.
+
+| tokens | run | MME-P | POPE | SciQA | TextVQA | GQA |
+|---|---|---|---|---|---|---|
+| 256 | parcel-exact CLIP nolora | 1129 | 82.8 | 48.1 | 26.5 | 54.5 |
+| 256 | parcel-exact CLIP lora | 1147 | 83.4 | 50.1 | 28.6 | 55.2 |
+| 256 | parcel-exact so400m/224 nolora | 1080 | 82.4 | 43.3 | 26.3 | 53.1 |
+| 256 | parcel-exact so400m/224 lora | 1097 | 82.1 | 43.7 | 27.1 | 53.9 |
+| 256 | final-parcel (CLIP, Nest) | 1170 | 84.3 | 48.1 | 28.5 | 56.1 |
+| 256 | M3 ladder (CLIP) | 1252 | 84.5 | 56.8 | 35.1 | 57.9 |
+| 144 | parcel-exact CLIP nolora / lora | 1134 / 1145 | 82.8 / 83.4 | 48.6 / 50.6 | 26.8 / 28.5 | 54.7 / 55.1 |
+| 144 | so400m/224 nolora / lora | 1078 / 1129 | 82.7 / 82.4 | 43.1 / 43.1 | 26.6 / 27.2 | 53.1 / 53.4 |
+| 144 | final-parcel / M3 | 1142 / 1255 | 84.2 / 84.6 | 48.1 / 56.9 | 26.3 / 34.3 | 55.3 / 58.2 |
+| 64 | parcel-exact CLIP nolora / lora | 1104 / 1150 | 81.8 / 83.1 | 48.7 / 49.0 | 26.3 / 27.7 | 54.3 / 54.9 |
+| 64 | so400m/224 nolora / lora | 1079 / 1091 | 81.8 / 81.6 | 42.0 / 41.7 | 26.4 / 26.9 | 52.3 / 52.9 |
+| 64 | final-parcel / M3 | 1155 / 1253 | 83.0 / 83.9 | 47.5 / 55.4 | 23.7 / 30.6 | 54.5 / 57.7 |
+| 16 | parcel-exact CLIP nolora / lora | 1068 / 1094 | 79.8 / 81.9 | 46.9 / 47.3 | 18.7 / 19.9 | 52.8 / 52.9 |
+| 16 | so400m/224 nolora / lora | 1084 / 1075 | 78.9 / 78.8 | 42.1 / 41.5 | 19.7 / 19.9 | 51.2 / 51.1 |
+| 16 | final-parcel / M3 | 1124 / 1245 | 80.5 / 82.6 | 46.4 / 53.7 | 19.7 / 21.2 | 52.6 / 55.7 |
+
+[FACT] **The PARCEL-literal connector does not close the gap to M3 and is no better than final-parcel.** parcel-exact CLIP trails the M3 ladder on every task at every budget: TextVQA -8.6 / -7.5 / -4.3 / -2.5 (nolora) and -6.5 / -5.8 / -2.9 / -1.3 (lora) at 256 / 144 / 64 / 16. Against final-parcel (which has the vision LoRA) the lora variant is level at 256 (28.6 vs 28.5), +2.2 at 144 and +4.0 at 64 on TextVQA, and -0.2 at 16, so the literal routing helps only where it removes queries (144 and 64).
+
+[FACT] **TextVQA is flat from 256 to 64 tokens** (nolora 26.5 / 26.8 / 26.3; lora 28.6 / 28.5 / 27.7), although the 256 level carries 192 learned queries, the 144 level 80, and the 64 level none. The 64-token level is pure pooling, and it equals the 256-token level. Together with §16 (SigLIP-384: 9 anchors at 144 and at 64 gave the same 28.6-28.9) this is now two independent observations that **the learned queries add nothing measurable on any benchmark**; the information is in the pooled anchors.
+
+[FACT] **The 64- and 16-token levels are the same operation as M3's pooling (64 or 16 raw anchors through the projector), yet score 4.3 and 2.5 TextVQA lower than the M3 ladder (nolora; 2.9 and 1.3 for lora).** So the remaining gap at those two budgets cannot be the connector architecture; it is the training. Differences from the M3 ladder run that this experiment does not separate: uniform sampling of an arbitrary budget per step instead of the ladder, one shared projector for all budgets, the Stage 1 recipe (whether the projector is aligned to raw CLIP features at all levels, §13.3 items 1-3), the Stage 2 LR 1e-5 versus the LLaVA recipe, the queries/self-attention parameters present in the model (harmless at pure-anchor budgets by construction, but trained on the other budgets), and the M3 checkpoint being trained on hipster with a recipe not re-verified here (§14).
+
+[FACT] **The vision LoRA gives a small, consistent gain** (CLIP parcel-exact: TextVQA +2.1 / +1.7 / +1.4 / +1.2, SciQA +2.0 / +2.0 / +0.3 / +0.4, MME-P +18 / +11 / +46 / +26 at 256 / 144 / 64 / 16), smaller than the +6 to +8 TextVQA of §13.4 on the Nest recipe. [CAVEAT] the CLIP LoRA run used the plain smallest-level rule for the rank-64 adapter (§15.5), the hipster runs the `lora_small_budget_max=30` band.
+
+[FACT] **SigLIP-so400m at 224 px (256 patches) is no better than CLIP-L/336** inside the same PARCEL pipeline: TextVQA 26.3-27.2 against 26.5-28.6 at 256 / 144 / 64, tied at 16 (19.7-19.9 against 18.7-19.9), and worse on SciQA (43 vs 48-50, about -5 to -7), MME-P (-50 at 256) and GQA (-1.4). [INTERP] This resolves §15.4: SigLIP's 38.4 TextVQA at 256 in §16 came from **resolution (729 patches at 384 px) and its 81 anchors**, not from the SigLIP weights; a 224-px SigLIP gives up OCR resolution and gains nothing on this model. The LoRA effect on SigLIP is +0.8 / +0.6 / +0.5 / +0.2 TextVQA, smaller than on CLIP.
+
+[INTERP, decision] The connector hypothesis of §13 is now narrowed: the queries are useless (replicated), so "Nest/PARCEL trails M3" is **not** a query-architecture problem that a better PCQR can fix, and parcel-exact's remaining deficit at pure-pooling budgets points to **training procedure** (alignment of the projector, sampling, LR). The cheapest decisive experiment is to run the M3 ladder's own recipe with the Nest pipeline's extras switched on one at a time, or equivalently the parcel-exact pipeline with the M3 Stage 1 (all ladder levels aligned) and a ladder in Stage 2 instead of uniform sampling.
