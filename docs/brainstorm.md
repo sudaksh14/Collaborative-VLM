@@ -622,3 +622,40 @@ Four runs finished: DAS-6 `parcel-exact-nolora` (train 27983, eval 27984; 5197 s
 [FACT] **SigLIP-so400m at 224 px (256 patches) is no better than CLIP-L/336** inside the same PARCEL pipeline: TextVQA 26.3-27.2 against 26.5-28.6 at 256 / 144 / 64, tied at 16 (19.7-19.9 against 18.7-19.9), and worse on SciQA (43 vs 48-50, about -5 to -7), MME-P (-50 at 256) and GQA (-1.4). [INTERP] This resolves §15.4: SigLIP's 38.4 TextVQA at 256 in §16 came from **resolution (729 patches at 384 px) and its 81 anchors**, not from the SigLIP weights; a 224-px SigLIP gives up OCR resolution and gains nothing on this model. The LoRA effect on SigLIP is +0.8 / +0.6 / +0.5 / +0.2 TextVQA, smaller than on CLIP.
 
 [INTERP, decision] The connector hypothesis of §13 is now narrowed: the queries are useless (replicated), so "Nest/PARCEL trails M3" is **not** a query-architecture problem that a better PCQR can fix, and parcel-exact's remaining deficit at pure-pooling budgets points to **training procedure** (alignment of the projector, sampling, LR). The cheapest decisive experiment is to run the M3 ladder's own recipe with the Nest pipeline's extras switched on one at a time, or equivalently the parcel-exact pipeline with the M3 Stage 1 (all ladder levels aligned) and a ladder in Stage 2 instead of uniform sampling.
+
+
+## 18. Why parcel_exact trails the M3 ladder at TinyLlama scale: recipe audit and the two ablation runs (2026-11-03)
+
+### 18.1 The M3 ladder recipe, verified against the repo (hipster branch scripts = DAS-6 scripts)
+
+[FACT, from `finetune_baseline_slm.sh` and `finetune_baseline_slm_hipster.sh`; the hipster run manifest itself could not be read, SSH to both clusters was down] The M3 ladder (hipster job 365681) is M3's own multi-scale loop: `MATRYOSHKA_SCALE=256,144,64,16`, **one forward per scale per step, CE averaged over the four scales**; full LLM fine-tune, LR **2e-5**, effective batch 128 (4 GPUs x 2 x 16 on hipster, same product as DAS-6), 1 epoch, cosine, warmup 0.03, vision frozen, `mlp2x_gelu` projector warm-started from the plain LLaVA Stage 1 (576 tokens, LR 1e-3, batch 256, `4tok` tag from DAS-6). Hyperparameters are identical between the DAS-6 and hipster scripts. M3 **projects all 576 patches first and pools the projected tokens** (`llava_arch.encode_images` runs `mm_projector`, then `matryoshka_vis_token_process`).
+
+[FACT] Open verification item: M3's integer-kernel pooling turns a 256-token level into the full 576 grid (`int(sqrt(576/256)) = 1`); the code now falls back to `adaptive_avg_pool2d` for such scales. The 256-level eval is not affected (M3@256 scores 35.1 against 41.2 for the 576-token model, so it was pooled), but whether the **training** of job 365681 ran before that fix is not recorded here; the smoke gate only checked 144 and 16. Check with `git log -S"H % g != 0"` on the DAS-6 repo against the job's start time.
+
+### 18.2 What differs between the M3 ladder and parcel_exact (all FACT, from the scripts)
+
+| | M3 ladder | parcel_exact |
+|---|---|---|
+| Stage 1 | plain projector on all 576 patches, LR 1e-3 | resampler + projector at the 256 level only, LR 1e-3 |
+| Order | project each patch, **then** pool | pool raw CLIP features, **then** project |
+| Stage 2 LR | 2e-5 | 1e-5 |
+| Views per step | all 4 budgets, CE averaged | 1 budget, B ~ U{16,18,...,256} |
+| Share of steps in which a budget is a *pure-pooling* budget | 100 % of steps contain 16 and 64 as pure pooling | B = 16 and B = 64 are each 1 step in 121 |
+| New parameters | none | queries + self-attention + cross-attention (unused at pure-pooling budgets) |
+
+### 18.3 Why PARCEL wins in PaliGemma-2 but not here (what the evidence supports)
+
+1. **Data scale explains the queries, not the whole gap.** The paper trains the connector on ~100M + 100M samples at global batch 8192; we use 558K + 665K (about 170x less) at batch 128. Our learned queries are useless (§17: TextVQA flat 256 -> 64, effective rank 13.9 %), which is what an undertrained random-init bank looks like. [INTERP, not tested here] With 100M samples the queries can learn something; with 1.2M they do not. But the 64- and 16-token levels contain **no queries at all**, and they still trail M3 by 4.3 and 2.5 TextVQA, so data volume for the resampler cannot be the only cause.
+2. **The pure-pooling levels are barely trained.** Under uniform sampling the evaluated 64- and 16-token configurations (pure anchors) are drawn in 1 step in 121 each; M3 trains them in every step. [INTERP] The LLM and projector see "anchors + queries" almost always, and the pure-anchor input rarely.
+3. **Order of operations.** M3's projector only ever sees per-patch features (its Stage 1 input); ours sees pooled, smoothed features at levels where its Stage 1 (256 only) never aligned it. [INTERP, untested]
+4. **Optimisation.** LR 1e-5 is PaliGemma-2's 2e-5 halved for batch 8192; at batch 128 and 5197 steps it is a different regime from the LLaVA recipe that M3 uses at 2e-5. One view per step also gives each budget a quarter of the gradient signal.
+5. **Scale of the model and the encoder.** PaliGemma-2 trains a 2B-27B Gemma-2 jointly with a trainable SigLIP at 224 px, where the top budget (256) is the uncompressed grid; ours is a frozen CLIP-L/336 whose 256 budget already compresses 576 patches into 256, feeding a 1.1B TinyLlama. A small LLM has less capacity to recover from lost tokens. [INTERP]
+6. **The comparison itself.** PARCEL's claim (per §14.3) is retention against MQT/M3 trained under the same large-scale setting; at LLaVA-1.5 scale M3 is the method with zero new parameters, so it is the one that wins when data and steps are scarce.
+
+So: needing a lot of data is a likely part (points 1, 5), but points 2 to 4 are recipe differences that are testable at our scale, and they are what runs 1 and 2 test.
+
+### 18.4 The two ablation runs (recipes added 2026-11-03, NOT yet submitted: SSH to DAS-6 and hipster was down)
+
+- **Run 1 `parcel-exact-m3recipe`**: parcel_exact (PARCEL routing, queries kept, frozen CLIP) with M3's Stage 2: LR 2e-5 and all four ladder levels every step (`SINGLE_BUDGET_PER_STEP=False`, `budget_sampling=ladder`: the engine runs the whole grid and averages CE, = M3's loop); reuses `parcel-exact-nolora`'s Stage 1 (`SKIP_STAGE1=1`), so the **only** change against that run is points 2 and 4 above. Prediction: if the gap is Stage 2 recipe, pure-pooling levels (64, 16) rise to about M3's 30.6 / 21.2.
+- **Run 2 `m3-pool-lora`**: M3 ladder + nested vision LoRA: routing {16:16, 64:64, 144:144, 256:256} (every level a pure-anchor budget, no query is ever used), `project_before_pool=True` (M3's order: project the 576 patches, then pool, adaptive pooling at 256 as M3 does), per-level rank-nested vision LoRA `8 16 32 64`, LR 2e-5, ladder loss. Own Stage 1 (256 pooled tokens, projector only). Prediction: ~M3 ladder without LoRA, plus the +1 to +2 TextVQA the vision LoRA gave in §17 (the older Nest recipe gave +6 to +8).
+- Code: `_pool_anchors_parcel` (parcel_exact falls back to adaptive pooling for perfect squares that do not divide the grid; exact-stride path unchanged), `project_before_pool` (config, engine, CLI, launchers), `SKIP_STAGE1` in `run_job_slm.sh`; unit tests 11 and 12 in `jobs/test_parcel_exact.sh` (not yet run: no torch locally, they run on node201).
