@@ -654,7 +654,7 @@ Four runs finished: DAS-6 `parcel-exact-nolora` (train 27983, eval 27984; 5197 s
 
 So: needing a lot of data is a likely part (points 1, 5), but points 2 to 4 are recipe differences that are testable at our scale, and they are what runs 1 and 2 test.
 
-### 18.4 The two ablation runs (recipes added 2026-11-03, NOT yet submitted: SSH to DAS-6 and hipster was down)
+### 18.4 The two ablation runs (recipes added 2026-11-03; submitted later that day and finished, results in §19)
 
 - **Run 1 `parcel-exact-m3recipe`**: parcel_exact (PARCEL routing, queries kept, frozen CLIP) with M3's Stage 2: LR 2e-5 and all four ladder levels every step (`SINGLE_BUDGET_PER_STEP=False`, `budget_sampling=ladder`: the engine runs the whole grid and averages CE, = M3's loop); reuses `parcel-exact-nolora`'s Stage 1 (`SKIP_STAGE1=1`), so the **only** change against that run is points 2 and 4 above. Prediction: if the gap is Stage 2 recipe, pure-pooling levels (64, 16) rise to about M3's 30.6 / 21.2.
 - **Run 2 `m3-pool-lora`**: M3 ladder + nested vision LoRA: routing {16:16, 64:64, 144:144, 256:256} (every level a pure-anchor budget, no query is ever used), `project_before_pool=True` (M3's order: project the 576 patches, then pool, adaptive pooling at 256 as M3 does), per-level rank-nested vision LoRA `8 16 32 64`, LR 2e-5, ladder loss. Own Stage 1 (256 pooled tokens, projector only). Prediction: ~M3 ladder without LoRA, plus the +1 to +2 TextVQA the vision LoRA gave in §17 (the older Nest recipe gave +6 to +8).
@@ -665,3 +665,55 @@ So: needing a lot of data is a likely part (points 1, 5), but points 2 to 4 are 
 - **256-token pooling fix is older than the M3 ladder training** [FACT]: the fix is commit `b684aae` (2026-09-29 17:52); hipster's `llava_arch.py` was last written 2026-09-29 18:18; the hipster M3 ladder job 365681 started 2026-10-01 17:42 and the eval 27973 ran 2026-10-27. The M3@256 numbers (TextVQA 35.1 against the dense 576-token 41.2) are therefore real 256-token results. The only run affected by the bug was the cancelled single-256 attempt 27537, never evaluated.
 - **Run 2 moved to hipster and a control added** [FACT]: `m3-pool-lora` (train 384711 / eval 384712) and `m3-pool-nolora` (384713 / 384714), both `performance` partition, 4 GPUs; the DAS-6 copy (28013 / 28014) was cancelled. `m3-pool-nolora` is run 3: identical recipe without the vision LoRA, so that (a) vs the M3 ladder it tests whether the elastic pipeline reproduces M3 (expect TextVQA about 35.1 / 34.3 / 30.6 / 21.2) and (b) vs `m3-pool-lora` it isolates the vision-LoRA effect, which the original run 2 could not (it differed from the M3 ladder in both the LoRA and the Stage 1).
 - **Run 1 (`parcel-exact-m3recipe`) stays on DAS-6** as train 28021 / eval 28022. Its first submission (28011) died instantly with "Permission denied": `sync_clusters.sh` wrote every changed script 0644 because master stores all scripts as 100644 (Windows). Fixed by recording mode 100755 for all tracked `*.sh` in master and restoring the bits on both clusters (committed there, sync tag re-baselined).
+
+## 19. Results update 2026-11-06: the three ablation runs, the control and the checkpoint audit
+
+All numbers: TinyLlama-1.1B, CLIP-L/336 unless stated, lmms-eval full benchmarks, percent. DAS-6 eval 28022 (run 1) and hipster evals 384712 / 384714 (runs 2 and 3, `performance` partition). Both queues were empty on 2026-11-06 (all runs finished).
+
+### 19.1 Which Stage-1 checkpoint each baseline really uses (answers "is the 4tok pretrain our parcel token count?")
+
+[FACT, from `config.json` / `elastic_config.json` / the scripts] **No for M3, yes for MQT.**
+
+| Method | Stage-1 checkpoint (renamed 2026-11-06) | Tokens at Stage 1 | Stage 2 |
+|---|---|---|---|
+| M3 ladder (and M3 576 control) | `m3-baseline-pretrain-576tok` (was `baseline-tinyllama-4tok-pretrain`) | **576**: plain `mlp2x_gelu` projector on all CLIP patches, no pooling | M3 average pooling to the ladder budgets |
+| MQT 4-token and MQT ladder | `mqt-baseline-pretrain-256tok` (was `mqt-pretrain-tinyllama-4tok`) | **256** queries (`num_visual_tokens=first_stage`) | 4, or 256/144/64/16 |
+| Nest-VLM / parcel / parcel_exact / m3-pool | `elastic-pretrain-tinyllama-*` | **256** (`tok_levels=[256]`, `STAGE1_TOK_LEVEL=256`, LoRA rank 64 for the LoRA variants) | the 256/144/64/16 ladder |
+
+The old "4tok" in the directory names was only a reuse tag (`BASELINE_PRETRAIN_TAG=4tok`), not a token count. The scripts now point at the new names directly (commit `617d9aa`, no symlinks; `PRETRAIN_DIR` overrides). [INTERP] MQT and our runs therefore share a 256-token Stage 1, while M3's Stage 1 sees 576 tokens, one more difference to keep in mind when reading M3 against parcel_exact (see §18.2). Both checkpoints are on the SURFdrive share under the new names; the old-name folders still need deleting in the web UI.
+
+### 19.2 Results of the three §18.4/§18.5 runs
+
+| Run | Tokens | GQA | POPE | SQA | TextVQA | MME-P |
+|---|---|---|---|---|---|---|
+| parcel-exact (no LoRA, earlier) | 16 / 64 / 144 / 256 | 52.8 / 54.3 / 54.7 / 54.5 | 79.8 / 81.8 / 82.8 / 82.8 | 46.9 / 48.7 / 48.6 / 48.1 | 18.7 / 26.3 / 26.8 / 26.5 | 1068 / 1104 / 1134 / 1129 |
+| parcel-exact-lora (earlier) | 16 / 64 / 144 / 256 | 52.9 / 54.9 / 55.1 / 55.2 | 81.9 / 83.1 / 83.4 / 83.4 | 47.3 / 49.0 / 50.6 / 50.1 | 19.9 / 27.7 / 28.5 / 28.6 | 1094 / 1150 / 1145 / 1147 |
+| **Run 1** parcel-exact-m3recipe (DAS-6) | 16 / 64 / 144 / 256 | 54.4 / 56.3 / 56.5 / 56.4 | 81.7 / 83.4 / 83.5 / 83.6 | 47.1 / 48.8 / 48.6 / 48.6 | 19.1 / 27.5 / 27.3 / 27.3 | 1156 / 1175 / 1204 / 1199 |
+| **Run 2** m3-pool-lora (hipster) | 16 / 64 / 144 / 256 | 55.0 / 57.2 / 57.9 / 57.8 | 82.5 / 85.2 / 86.0 / 85.7 | 43.2 / 44.0 / 44.1 / 44.3 | 24.5 / 32.2 / 35.1 / 35.9 | 1182 / 1194 / 1187 / 1188 |
+| **Run 3** m3-pool-nolora (hipster) | 16 / 64 / 144 / 256 | 54.3 / 55.8 / 56.5 / 56.9 | 82.8 / 84.4 / 84.9 / 85.0 | 42.8 / 43.8 / 45.3 / 44.5 | 21.4 / 29.8 / 33.5 / 34.0 | 1182 / 1212 / 1212 / 1230 |
+| parcel-exact-so400m224-lora (hipster, SigLIP-so400m/224) | 16 / 64 / 144 / 256 | 51.1 / 52.9 / 53.4 / 53.9 | 78.8 / 81.6 / 82.4 / 82.1 | 41.5 / 41.7 / 43.1 / 43.7 | 19.9 / 26.9 / 27.2 / 27.1 | 1075 / 1091 / 1129 / 1097 |
+| parcel-exact-so400m224-nolora (hipster) | 16 / 64 / 144 / 256 | 51.2 / 52.3 / 53.1 / 53.1 | 78.9 / 81.8 / 82.7 / 82.4 | 42.1 / 42.0 / 43.1 / 43.3 | 19.7 / 26.4 / 26.6 / 26.3 | 1084 / 1079 / 1078 / 1080 |
+
+Reference ladders on the same backbone (DAS-6):
+
+| Method | Tokens | GQA | POPE | SQA | TextVQA | VQAv2 |
+|---|---|---|---|---|---|---|
+| M3 ladder | 16 / 64 / 144 / 256 | 55.7 / 57.7 / 58.2 / 57.8 | 82.6 / 83.9 / 84.6 / 84.5 | 53.7 / 55.4 / 56.9 / 56.8 | 21.2 / 30.6 / 34.2 / 35.1 | 66.5 / 69.4 / 70.5 / 70.6 |
+| M3 at 324 / 400 / 484 / 576 | | 58.2 / 57.8 / 57.8 / 57.4 | 84.9 / 84.2 / 84.5 / 83.7 | 56.4 / 56.6 / 56.0 / 54.5 | 34.7 / 35.2 / 35.2 / 36.7 | 70.6 / 70.7 / 70.6 / 70.5 |
+| MQT ladder | 16 / 64 / 144 / 256 | 51.8 / 53.3 / 54.2 / 54.8 | 79.4 / 81.2 / 81.9 / 83.2 | 52.3 / 52.9 / 52.9 / 53.3 | 18.4 / 21.6 / 22.7 / 24.9 | 62.5 / 64.4 / 64.9 / 65.9 |
+| MQT 4 tokens | 4 | 50.9 | 78.9 | 51.5 | 14.6 | not run |
+
+### 19.3 What this settles
+
+1. [FACT] **Run 2 (M3 order and routing plus nested vision LoRA) closes the gap to M3 on GQA, POPE and TextVQA.** At 256 tokens: GQA 57.8 vs 57.8, POPE 85.7 vs 84.5, TextVQA 35.9 vs 35.1; at 144: 57.9 vs 58.2, 86.0 vs 84.6, 35.1 vs 34.2. At 16 tokens it is ahead on POPE and TextVQA (82.5 vs 82.6 and 24.5 vs 21.2) and 0.7 behind on GQA. It is the strongest elastic run so far (parcel-exact-lora tops out at 55.2 GQA / 28.6 TextVQA).
+2. [FACT] **The vision LoRA helps in the M3-style recipe: run 2 vs run 3**, about +1 GQA and +2 TextVQA at 144/256, +0.7 POPE; MME-P is the exception (run 3 is higher). In parcel_exact the LoRA is worth far less (0 to 1 point), and in the so400m224 runs it is within noise.
+3. [FACT] **Run 1 (parcel_exact with M3's Stage 2, queries kept) gains about +1.3 GQA and +2 to +5 MME-P over parcel-exact-lora but no TextVQA** (27.3 vs 28.6, slightly worse). M3's LR and all-levels-every-step loop explain part of the §18 gap on GQA and POPE; they do not fix TextVQA. [INTERP] The remaining TextVQA gap (27 vs 35) follows the routing: runs 2 and 3 use pure-anchor budgets and project-then-pool, which keep the fine text detail; the learned-query path in run 1 does not (consistent with §17, flat TextVQA from 256 to 64).
+4. [FACT] **Elastic models are weaker on SQA than the baselines everywhere**, and run 2/3 are the worst (about 44 vs 55 to 57 for M3, 53 for MQT). This is not explained: SQA is nearly flat in token count for every method, and the elastic Stage-2 data/recipe is the same as M3's. [OPEN] The cause is untested; candidates are the nested LoRA / hipster environment (hipster SQA is 4 to 5 points below the DAS-6 elastic runs, and SQA under run 3 without LoRA is equally low), the prompt/template at eval, or the eval image path for ScienceQA. An SQA check of one checkpoint evaluated on both clusters would separate the environment from the recipe.
+5. [FACT] **SigLIP-so400m/224 under parcel_exact is the weakest backbone tried** (53.9 GQA, 27.1 TextVQA at 256) and the LoRA does not help it. Confirms the §16/§17 reading that the encoder swap does not rescue the query-based path at this data scale.
+6. [INTERP, for the paper] The honest claim is no longer "nested elastic trails M3". With M3's routing and order, one model trained with nested LoRA matches the M3 ladder on three of five benchmarks (GQA, POPE, TextVQA) from one set of weights, but is behind on ScienceQA, and was not evaluated on VQAv2. M3 also uses a 576-token Stage 1 (§19.1), so the match is not an apples-to-apples Stage-1 comparison.
+
+### 19.4 Caveats and next steps
+
+- Runs 2 and 3 are single-seed; hipster and DAS-6 differ in GPU (RTX 6000 Ada vs A40/A10) and so in batch size per device, so cross-cluster differences under about 1 point should not be over-read.
+- VQAv2 is missing for runs 1 to 3 and the so400m224 runs (the result files I read had no VQAv2 entry; I did not check why); add it before any M3 comparison table goes into the paper.
+- Next: (a) SQA diagnostic above; (b) VQAv2 for runs 1 to 3; (c) decide whether m3-pool-lora replaces final-parcel as the main Nest-VLM recipe; (d) a 576-token Stage 1 for the elastic path so Stage 1 matches M3.
